@@ -27,3 +27,12 @@ Start JupyterLab from the repository root with:
 ```bash
 uv run jupyter lab
 ```
+
+## Create a kernel
+
+If you have jupyter lab already installed, create a new kernel with:
+
+```bash
+uv run python -m ipykernel install --user --name=fish-segmentation --display-name="smell-like-fish"
+```
+
