@@ -16,7 +16,9 @@ def flash_attn_func_op(
 
 
 def flash_attn_func(q, k, v):
-    dtype = torch.float8_e4m3fn
+    # FIX para flash attention
+    # old: dtype = torch.float8_e4m3fn
+    dtype = torch.bfloat16
     return flash_attn_func_op(q.to(dtype), k.to(dtype), v.to(dtype)).to(q.dtype)
 
 
