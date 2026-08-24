@@ -435,7 +435,6 @@ requires-dist = [
     { name = "torch", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = ">=0.25.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "triton", marker = "sys_platform != 'win32'", specifier = ">=3.6.0" },
-    { name = "triton-windows", marker = "sys_platform == 'win32'", specifier = ">=3.7.1.post27" },
 ]
 
 [[package]]

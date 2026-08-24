@@ -9,7 +9,7 @@ authors = [
 requires-python = "==3.12.*"
 dependencies = [
     "einops>=0.8.2",
-    "flash-attn-3>=3.0.0",
+    #"flash-attn-3>=3.0.0",
     "gdown>=6.1.0",
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
