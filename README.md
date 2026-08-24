@@ -1,4 +1,5 @@
 # Fish Segmentation
+This project uses [sam3](https://github.com/facebookresearch/sam3).
 
 ## Requirements
 

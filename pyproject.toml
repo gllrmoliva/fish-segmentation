@@ -23,8 +23,7 @@ dependencies = [
     "setuptools<82",
     "torch==2.10.0",
     "torchvision>=0.25.0",
-    "triton>=3.6.0 ; sys_platform != 'win32'",
-    "triton-windows>=3.7.1.post27 ; sys_platform == 'win32'",
+    "triton>=3.6.0 ; sys_platform != 'win32'"
 ]
 
 [project.scripts]
@@ -42,8 +41,16 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
-sam3 = { git = "https://github.com/facebookresearch/sam3.git" }
+sam3 = { workspace = true, editable = true }
+
+[tool.uv.workspace]
+members = [
+    "sam3_src",
+]
 
 # esto es para confiar en pytorch
 [tool.uv]
 index-strategy = "unsafe-best-match"
+environments = [
+    "sys_platform == 'linux'",
+]
