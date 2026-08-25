@@ -208,6 +208,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False, # by gllrm
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
@@ -224,6 +225,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             resource_path=resource_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu, # by gllrm
             img_mean=self.image_mean,
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
