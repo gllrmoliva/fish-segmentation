@@ -2219,6 +2219,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,     # by gllrm
         async_loading_frames=False,
         use_torchcodec=False,
         use_cv2=False,
@@ -2228,6 +2229,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
+            offload_state_to_cpu=offload_state_to_cpu,     # by gllrm
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
