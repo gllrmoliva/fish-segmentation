@@ -6,6 +6,8 @@ This project uses [sam3](https://github.com/facebookresearch/sam3).
 - Git
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.12
+- ffmpeg
+- exiftool
 
 ## Installation
 
