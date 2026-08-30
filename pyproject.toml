@@ -12,6 +12,7 @@ dependencies = [
     "ffmpeg-python",
     "flash-attn-3>=3.0.0",
     "gdown>=6.1.0",
+    "imageio[ffmpeg,pyav]>=2.37.4",
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
     "matplotlib>=3.11.1",
@@ -25,6 +26,7 @@ dependencies = [
     "setuptools<82",
     "torch==2.10.0",
     "torchvision>=0.25.0",
+    "tqdm>=4.70.0",
     "triton>=3.6.0 ; sys_platform != 'win32'",
 ]
 
