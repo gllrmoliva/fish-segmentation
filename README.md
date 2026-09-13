@@ -31,6 +31,10 @@ Start JupyterLab from the repository root with:
 uv run jupyter lab
 ```
 
+Driver notebooks live in `notebooks/`; all functions and classes live in the
+`fish_segmentation` package (`src/fish_segmentation/`). See `docs/index.md` for
+the reading order.
+
 ## Create a kernel
 
 If you have jupyter lab already installed, create a new kernel with:
