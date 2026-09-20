@@ -91,10 +91,16 @@ def compute_anomaly_heatmap(
     target_shape: Tuple[int, int],
     max_sample_pool: int = 1500,
     border_margin_pct: float = 0.05,
+    normalize: bool = True,
 ) -> np.ndarray:
     """
     Calculates cosine-distance anomaly scores, suppresses border tokens,
     and bicubic-upsamples back to the target pixel resolution.
+
+    Args:
+        normalize: min-max scale the result to [0, 1]. Tiling passes False so
+            raw scores from different tiles stay comparable; the stitched map is
+            normalized once at the end.
     """
     h_patches, w_patches = grid_shape
     num_patches = h_patches * w_patches
@@ -102,7 +108,13 @@ def compute_anomaly_heatmap(
 
     # Contrast against sampled reference pool to avoid O(N^2) memory bottlenecks
     if num_patches > (max_sample_pool * 2):
-        sample_idx = torch.randperm(num_patches, device=tokens.device)[:max_sample_pool]
+        # Fixed seed: the same reference pattern is reused every call, so tiled
+        # bias subtraction and repeated runs stay reproducible.
+        generator = torch.Generator(device=tokens.device)
+        generator.manual_seed(0)
+        sample_idx = torch.randperm(
+            num_patches, generator=generator, device=tokens.device
+        )[:max_sample_pool]
         similarity_matrix = torch.matmul(tokens, tokens[sample_idx].T)
     else:
         similarity_matrix = torch.matmul(tokens, tokens.T)
@@ -131,6 +143,9 @@ def compute_anomaly_heatmap(
         .cpu()
         .numpy()
     )
+
+    if not normalize:
+        return upsampled
 
     # Min-max normalization
     norm_score = (upsampled - upsampled.min()) / (
@@ -192,14 +207,49 @@ def _run_dino_heatmap(
     processor: AutoImageProcessor,
     scale: float,
     device: str,
+    normalize: bool = True,
 ) -> np.ndarray:
     pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
         image, processor, scale=scale, device=device
     )
     tokens = extract_patch_tokens(model, pixel_values, num_patches=h_patches * w_patches)
     return compute_anomaly_heatmap(
-        tokens, grid_shape=(h_patches, w_patches), target_shape=orig_shape
+        tokens,
+        grid_shape=(h_patches, w_patches),
+        target_shape=orig_shape,
+        normalize=normalize,
     )
+
+
+def _tile_window(
+    shape: Tuple[int, int],
+    x0: int,
+    y0: int,
+    width: int,
+    height: int,
+    overlap_px: int,
+) -> np.ndarray:
+    """Cosine feather weights: 1 inside a tile, tapering over the overlap band.
+
+    Sides that coincide with the image border are not tapered, so edge pixels
+    keep full weight. Adjacent tiles' tapers sum to 1 across the overlap band.
+    """
+    th, tw = shape
+    wx = np.ones(tw, dtype=np.float32)
+    wy = np.ones(th, dtype=np.float32)
+    if overlap_px > 0:
+        m = min(overlap_px, tw // 2, th // 2)
+        if m > 0:
+            ramp = (0.5 - 0.5 * np.cos(np.pi * np.arange(m) / m)).astype(np.float32)
+            if x0 > 0:
+                wx[:m] = ramp
+            if x0 + tw < width:
+                wx[-m:] = ramp[::-1]
+            if y0 > 0:
+                wy[:m] = ramp
+            if y0 + th < height:
+                wy[-m:] = ramp[::-1]
+    return np.outer(wy, wx)
 
 
 def _tiled_dino_heatmap(
@@ -211,22 +261,33 @@ def _tiled_dino_heatmap(
     max_patches: int,
     tile_overlap: float = DEFAULT_TILE_OVERLAP,
 ) -> np.ndarray:
-    """Computes a high-resolution heatmap by averaging overlapping tile scores."""
+    """Computes a high-resolution heatmap from overlapping tiles.
+
+    Each tile is an independent image for the ViT, so it carries a smooth
+    positional bias (bright borders, dark center) that would otherwise repeat on
+    the tile lattice as a grid. The stitched map uses the cross-tile phase mean
+    -- the average raw score at the same position inside every tile -- as a
+    self-calibrated estimate of that repeating component and subtracts it per
+    tile, with no extra model passes. Tiles are then blended with a cosine
+    feather (so overlap-count steps cannot show as seams) and min-max normalized
+    once at the end. Tiles whose shape appears only once (degenerate views) keep
+    their raw scores.
+    """
     width, height = image.size
     tile_size = _tile_size_for_scale(scale, max_patches)
+    step = max(1, int(round(tile_size * (1 - tile_overlap))))
+    overlap_px = max(0, tile_size - step)
     x_starts = _tile_starts(width, tile_size, tile_overlap)
     y_starts = _tile_starts(height, tile_size, tile_overlap)
 
-    score_sum = np.zeros((height, width), dtype=np.float32)
-    score_count = np.zeros((height, width), dtype=np.float32)
-
+    tiles: list[tuple[int, int, np.ndarray]] = []
     for y0 in y_starts:
         for x0 in x_starts:
             x1, y1 = min(width, x0 + tile_size), min(height, y0 + tile_size)
             tile = image.crop((x0, y0, x1, y1))
             try:
                 tile_score = _run_dino_heatmap(
-                    tile, model, processor, scale=scale, device=device
+                    tile, model, processor, scale=scale, device=device, normalize=False
                 )
             except torch.cuda.OutOfMemoryError:
                 if torch.device(device).type != "cuda" or max_patches <= 1:
@@ -241,10 +302,32 @@ def _tiled_dino_heatmap(
                     max_patches=max(1, max_patches // 2),
                     tile_overlap=tile_overlap,
                 )
-            score_sum[y0:y1, x0:x1] += tile_score
-            score_count[y0:y1, x0:x1] += 1.0
+            tiles.append((x0, y0, tile_score))
 
-    return score_sum / np.maximum(score_count, 1.0)
+    # Repeating (lattice) component: mean raw score per within-tile position.
+    by_shape: dict[tuple[int, int], list[np.ndarray]] = {}
+    for _, _, raw in tiles:
+        by_shape.setdefault(raw.shape, []).append(raw)
+    phase_mean = {
+        shape: np.mean(np.stack(maps, axis=0), axis=0)
+        for shape, maps in by_shape.items()
+        if len(maps) > 1
+    }
+
+    score_sum = np.zeros((height, width), dtype=np.float32)
+    weight_sum = np.zeros((height, width), dtype=np.float32)
+    for x0, y0, raw in tiles:
+        corrected = raw - phase_mean.get(raw.shape, 0.0)
+        weight = _tile_window(raw.shape, x0, y0, width, height, overlap_px)
+        th, tw = raw.shape
+        score_sum[y0:y0 + th, x0:x0 + tw] += corrected * weight
+        weight_sum[y0:y0 + th, x0:x0 + tw] += weight
+
+    stitched = score_sum / np.maximum(weight_sum, 1e-6)
+    span = float(stitched.max() - stitched.min())
+    if span < 1e-6:
+        return np.zeros_like(stitched)
+    return (stitched - stitched.min()) / span
 
 
 def _compute_dino_heatmap(
@@ -457,8 +540,14 @@ def _dino_pass(
     percentile_threshold: float = 99.5,
     resolution_scale: float = 1.0,
     max_patches: int = DEFAULT_MAX_PATCHES,
+    trace: Optional[Dict] = None,
 ) -> np.ndarray:
-    """Runs DINO on one image view; returns binary anomaly mask at native image size."""
+    """Runs DINO on one image view; returns binary anomaly mask at native image size.
+
+    When ``trace`` is given, it is filled in-place with the view ``scale`` and the
+    raw normalized anomaly heatmap (``norm_score``), which the zoom trace uses to
+    render layer-by-layer diagnostics.
+    """
     scale = _view_scale(image, long_side, resolution_scale)
     norm_score = _compute_dino_heatmap(
         image,
@@ -468,6 +557,9 @@ def _dino_pass(
         device=device,
         max_patches=max_patches,
     )
+    if trace is not None:
+        trace["scale"] = scale
+        trace["norm_score"] = norm_score
     return segment_anomalies(norm_score, percentile_threshold=percentile_threshold)
 
 
@@ -501,15 +593,44 @@ def run_dino_view(
     return final_mask, norm_score, cropped_img
 
 
+def _boxes_within(a: list, b: list, gap: float) -> bool:
+    """True when two boxes are closer than ``gap`` px (gap=0 means overlap)."""
+    return (
+        a[0] - gap < b[2]
+        and a[2] + gap > b[0]
+        and a[1] - gap < b[3]
+        and a[3] + gap > b[1]
+    )
+
+
 def _interest_zones(
     mask: np.ndarray,
     margin: float = 0.3,
     min_area: int = 30,
     max_zone_fraction: float = 0.8,
+    merge_gap: float = 0.0,
+    min_zone_fraction: float = 0.0,
 ) -> list[tuple[int, int, int, int]]:
     """Binary mask -> expanded, merged bounding boxes of dense regions (native coords).
-    Small components are dropped before expansion so noise specks never form zones."""
+
+    Small components are dropped before expansion so noise specks never form zones.
+    Boxes closer than ``merge_gap`` (fraction of the view's long side) are merged
+    into one zone, so a single DINO pass sees several nearby objects with shared
+    context; ``merge_gap=0`` merges only overlapping boxes. Every zone is then
+    grown, centered and clamped to the image until both sides reach at least
+    ``min_zone_fraction`` of the long side, and zones covering more than
+    ``max_zone_fraction`` of the view are dropped (zooming gains nothing there).
+    """
+    if merge_gap < 0:
+        raise ValueError("merge_gap must be non-negative")
+    if not 0 <= min_zone_fraction <= 1:
+        raise ValueError("min_zone_fraction must be in the range [0, 1]")
+
     h, w = mask.shape
+    long_side = max(w, h)
+    gap_px = merge_gap * long_side
+    min_side_px = min_zone_fraction * long_side
+
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     raw = []
     for i in range(1, num_labels):
@@ -526,18 +647,45 @@ def _interest_zones(
             ]
         )
 
-    # greedy union of overlapping boxes until fixpoint
-    zones = []
-    for box in raw:
-        merged = False
-        for z in zones:
-            if box[0] < z[2] and box[2] > z[0] and box[1] < z[3] and box[3] > z[1]:
-                z[0], z[1] = min(z[0], box[0]), min(z[1], box[1])
-                z[2], z[3] = max(z[2], box[2]), max(z[3], box[3])
-                merged = True
-                break
-        if not merged:
-            zones.append(box)
+    # Union-find merge of boxes closer than gap_px (order-independent)
+    parent = list(range(len(raw)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(raw)):
+        for j in range(i + 1, len(raw)):
+            if _boxes_within(raw[i], raw[j], gap_px):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+    zones: list[list[int]] = []
+    zone_of_root: dict[int, list[int]] = {}
+    for i, box in enumerate(raw):
+        root = find(i)
+        if root not in zone_of_root:
+            zone_of_root[root] = list(box)
+            zones.append(zone_of_root[root])
+        else:
+            zone = zone_of_root[root]
+            zone[0], zone[1] = min(zone[0], box[0]), min(zone[1], box[1])
+            zone[2], zone[3] = max(zone[2], box[2]), max(zone[3], box[3])
+
+    # Enforce a minimum context area, centered on each zone and clamped to the view
+    for zone in zones:
+        if min_side_px <= 0:
+            continue
+        target = max(min_side_px, zone[2] - zone[0], zone[3] - zone[1])
+        cx = (zone[0] + zone[2]) / 2
+        cy = (zone[1] + zone[3]) / 2
+        zone[0], zone[2] = int(round(cx - target / 2)), int(round(cx + target / 2))
+        zone[1], zone[3] = int(round(cy - target / 2)), int(round(cy + target / 2))
+        zone[0], zone[1] = max(0, zone[0]), max(0, zone[1])
+        zone[2], zone[3] = min(w, zone[2]), min(h, zone[3])
 
     return [
         (x0, y0, x1, y1)
@@ -577,6 +725,9 @@ def run_zoom_detector(
     device: Optional[str] = None,
     resolution_scale: float = 1.0,
     max_patches: int = DEFAULT_MAX_PATCHES,
+    merge_gap: float = 0.0,
+    min_zone_fraction: float = 0.0,
+    trace: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """
     Coarse-to-fine zoom detection with an optional relative resolution multiplier.
@@ -584,6 +735,25 @@ def run_zoom_detector(
     interest zones from the ORIGINAL pixels and re-detects until the view is
     native and <=long_side. Oversized scaled views are processed in overlapping
     tiles. Points are merged across levels and returned normalized.
+
+    ``merge_gap`` and ``min_zone_fraction`` (both fractions of the view's long
+    side) control the context of each zoom crop: boxes closer than ``merge_gap``
+    are fused into one zone so a single DINO pass sees several nearby objects,
+    and every zone is grown to at least ``min_zone_fraction`` of the long side.
+    The defaults (0) keep the original per-component crops.
+
+    When ``trace`` is a list, one record per DINO view is appended in depth-first
+    order with keys:
+        - 'depth': recursion level.
+        - 'origin': (x, y) of the view in the letterbox-cropped original coords.
+        - 'size': (w, h) of the view.
+        - 'scale': relative resolution used to feed the view.
+        - 'feed_native': True when this view stopped the recursion (native size).
+        - 'norm_score': normalized anomaly heatmap at view resolution.
+        - 'mask': binary anomaly mask at view resolution.
+        - 'regions': extract_salient_regions() output (view coords).
+        - 'zones': interest-zone boxes this view recursed into (empty when stopped).
+        - 'points': raw (x, y, radius, depth) points emitted by this view, pre-merge.
 
     Returns list of dicts with keys:
         - 'x', 'y': normalized [0,1] center in original-image coords.
@@ -600,21 +770,49 @@ def run_zoom_detector(
     def recurse(img: Image.Image, ox: int, oy: int, depth: int) -> None:
         w, h = img.size
         feed_native = max(w, h) <= long_side
+        entry = None
+        if trace is not None:
+            entry = {"depth": depth, "origin": (ox, oy), "size": (w, h)}
+            trace.append(entry)
+        pass_kwargs = {} if entry is None else {"trace": entry}
         mask = _dino_pass(
             img, model, processor, long_side, device,
             percentile_threshold=percentile_threshold,
             resolution_scale=resolution_scale,
             max_patches=max_patches,
+            **pass_kwargs,
         )
         _, regions = extract_salient_regions(
             mask, min_absolute_pixels=min_object_pixels
         )
-        for reg in regions:
-            cx, cy = reg["center"]
-            points.append((ox + cx, oy + cy, reg["max_inscribed_radius"], depth))
+        level_points = [
+            (
+                ox + reg["center"][0],
+                oy + reg["center"][1],
+                reg["max_inscribed_radius"],
+                depth,
+            )
+            for reg in regions
+        ]
+        points.extend(level_points)
+
         if feed_native or depth >= max_levels:
-            return
-        for zx0, zy0, zx1, zy1 in _interest_zones(mask, margin=margin):
+            zones: list[tuple[int, int, int, int]] = []
+        else:
+            zones = _interest_zones(
+                mask,
+                margin=margin,
+                merge_gap=merge_gap,
+                min_zone_fraction=min_zone_fraction,
+            )
+        if entry is not None:
+            entry["feed_native"] = feed_native
+            entry["mask"] = mask
+            entry["regions"] = regions
+            entry["zones"] = zones
+            entry["points"] = level_points
+
+        for zx0, zy0, zx1, zy1 in zones:
             recurse(img.crop((zx0, zy0, zx1, zy1)), ox + zx0, oy + zy0, depth + 1)
 
     recurse(image, 0, 0, 0)
@@ -737,5 +935,201 @@ def plot_regions_with_centers(
         f"Salient Regions ({len(regions_info)} detected) — {title_suffix}"
     )
     ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+ZOOM_LEVEL_COLORS = [
+    "tab:blue",
+    "tab:green",
+    "tab:orange",
+    "tab:red",
+    "tab:purple",
+    "tab:brown",
+    "tab:pink",
+    "tab:gray",
+    "tab:olive",
+    "tab:cyan",
+]
+
+
+def _draw_region_markers(ax, regions_info: List[Dict]) -> None:
+    """Draws region interior points and their max inscribed circles on an axis."""
+    for reg in regions_info:
+        cx, cy = reg["center"]
+        radius = reg["max_inscribed_radius"]
+        ax.scatter(cx, cy, c="cyan", edgecolors="black", s=60, zorder=5)
+        if radius > 2:
+            ax.add_patch(
+                plt.Circle(
+                    (cx, cy),
+                    radius,
+                    color="cyan",
+                    fill=False,
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.8,
+                )
+            )
+
+
+def plot_zoom_overview(
+    image: Image.Image,
+    trace: List[Dict],
+    detections: Optional[List[Dict]] = None,
+    alpha: float = 0.25,
+    figsize: Tuple[float, float] = (14, 8),
+) -> None:
+    """Plots the whole zoom tree on one image: every traced view as a box.
+
+    Boxes are colored by recursion depth; final merged ``detections`` (as
+    returned by ``run_zoom_detector``) are drawn on top, colored by their
+    confirmation level.
+
+    Args:
+        image: the letterbox-cropped base frame passed to ``run_zoom_detector``.
+        trace: the list filled by ``run_zoom_detector(..., trace=trace)``.
+        detections: optional merged detections from the same call.
+    """
+    img_np = np.asarray(image.convert("RGB"))
+    W, H = image.size
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.imshow(img_np)
+
+    depth_colors = {}
+    for entry in trace:
+        depth = entry["depth"]
+        color = ZOOM_LEVEL_COLORS[depth % len(ZOOM_LEVEL_COLORS)]
+        depth_colors[depth] = color
+        ox, oy = entry["origin"]
+        w, h = entry["size"]
+        ax.add_patch(
+            plt.Rectangle(
+                (ox, oy),
+                w,
+                h,
+                facecolor=color,
+                edgecolor=color,
+                alpha=alpha,
+                linewidth=1.2,
+            )
+        )
+        ax.annotate(
+            f"L{depth}",
+            (ox + 4, oy + 14),
+            color="white",
+            fontsize=8,
+            weight="bold",
+            bbox=dict(boxstyle="round,pad=0.15", fc="black", alpha=0.55, lw=0),
+        )
+
+    for det in detections or []:
+        cx, cy = det["x"] * W, det["y"] * H
+        radius = det["radius"] * max(W, H)
+        color = ZOOM_LEVEL_COLORS[det["level"] % len(ZOOM_LEVEL_COLORS)]
+        ax.scatter(cx, cy, c=color, edgecolors="black", s=70, zorder=6)
+        if radius > 2:
+            ax.add_patch(
+                plt.Circle(
+                    (cx, cy),
+                    radius,
+                    color=color,
+                    fill=False,
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.9,
+                )
+            )
+
+    if depth_colors:
+        handles = [
+            plt.Line2D([0], [0], color=c, lw=6, label=f"depth {d}")
+            for d, c in sorted(depth_colors.items())
+        ]
+        ax.legend(handles=handles, loc="upper right", framealpha=0.8)
+
+    n_det = 0 if detections is None else len(detections)
+    ax.set_title(f"Zoom tree — {len(trace)} DINO views, {n_det} merged detections")
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_zoom_level(
+    image: Image.Image,
+    entry: Dict,
+    overlay_color: Tuple[int, int, int] = (255, 30, 30),
+    alpha: float = 0.45,
+    figsize: Tuple[float, float] = (24, 6),
+) -> None:
+    """Plots one traced DINO view as four image panels.
+
+    Panels: the raw view crop fed to DINO, its anomaly heatmap, the thresholded
+    mask with region centers/inscribed radii and child zoom zones, and the raw
+    points emitted by this view (pre-merge).
+
+    ``image`` must be the letterbox-cropped base frame passed to
+    ``run_zoom_detector``; the view is reconstructed from ``entry['origin']``
+    and ``entry['size']``.
+    """
+    ox, oy = entry["origin"]
+    w, h = entry["size"]
+    view = image.crop((ox, oy, ox + w, oy + h))
+    view_np = np.asarray(view.convert("RGB"))
+    mask = entry["mask"]
+    regions = entry["regions"]
+    zones = entry["zones"]
+
+    fig, axes = plt.subplots(1, 4, figsize=figsize)
+
+    axes[0].imshow(view_np)
+    axes[0].set_title(f"layer input — {w}x{h} @ ({ox}, {oy})")
+
+    heat = axes[1].imshow(entry["norm_score"], cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1].set_title("anomaly heatmap")
+    fig.colorbar(heat, ax=axes[1], fraction=0.046, pad=0.04)
+
+    overlay = view_np.copy()
+    overlay[mask > 0] = overlay_color
+    axes[2].imshow(cv2.addWeighted(view_np, 1 - alpha, overlay, alpha, 0))
+    axes[2].set_title(f"mask + {len(regions)} regions + {len(zones)} zones")
+    for zx0, zy0, zx1, zy1 in zones:
+        axes[2].add_patch(
+            plt.Rectangle(
+                (zx0, zy0),
+                zx1 - zx0,
+                zy1 - zy0,
+                fill=False,
+                edgecolor="cyan",
+                linestyle="--",
+                linewidth=1.2,
+            )
+        )
+    _draw_region_markers(axes[2], regions)
+
+    axes[3].imshow(view_np)
+    axes[3].set_title(f"points emitted ({len(entry['points'])})")
+    for px, py, radius, _ in entry["points"]:
+        cx, cy = px - ox, py - oy
+        axes[3].scatter(cx, cy, c="cyan", edgecolors="black", s=60, zorder=5)
+        if radius > 2:
+            axes[3].add_patch(
+                plt.Circle(
+                    (cx, cy),
+                    radius,
+                    color="cyan",
+                    fill=False,
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.8,
+                )
+            )
+
+    stop = " — native stop" if entry["feed_native"] else ""
+    fig.suptitle(
+        f"depth {entry['depth']} | scale {entry['scale']:.2f}{stop}"
+    )
+    for ax in axes:
+        ax.axis("off")
     plt.tight_layout()
     plt.show()
