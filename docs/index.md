@@ -28,6 +28,8 @@ Support files:
   multiplex video predictor constructor-argument reference.
 - [notebooks/07_dinov3_zoom_levels.md](notebooks/07_dinov3_zoom_levels.md) —
   trace-driven layer-by-layer view of the DINO zoom detector.
+- [notebooks/08_dinov3_heatmap_ab.md](notebooks/08_dinov3_heatmap_ab.md) —
+  score-mode/local-contrast and mask-method A/B for the DINO detector.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 
