@@ -33,18 +33,27 @@ Driver: `notebooks/03_dinov3_detect.ipynb`.
    `{'label', 'area', 'center': (x, y), 'max_inscribed_radius'}` where `center`
    is the distance-transform maximum (guaranteed inside the component).
 7. End-to-end wrapper: `run_dino_detector(raw_image, model, processor,
-   resolution_scale=4.0, percentile_threshold=99.5, visualize=True, device=None)`
-   → `(final_mask, norm_score, cropped_image)`.
+    resolution_scale=4.0, percentile_threshold=99.5, visualize=True, device=None)`
+    → `(final_mask, norm_score, cropped_image)`.
+8. Zoom driver: `run_zoom_detector(..., long_side=1024,
+   resolution_scale=4.0)` applies the multiplier to every coarse and recursive
+   view. Views exceeding the patch budget are split into overlapping tiles and
+   their heatmaps are averaged back into native coordinates.
+   `run_dino_view()` exposes one such view for heatmap diagnostics.
 
 ## Visualization helpers
 
+- `plot_detection_results(image, norm_score, final_mask)` — side-by-side input,
+  raw normalized anomaly heatmap, and thresholded-mask overlay for diagnosing
+  empty detections.
 - `plot_regions_with_centers(image, filtered_mask, regions_info, show_mask=True,
   show_radius=True, ...)` — interior points, optional inscribed circles.
 
 ## Gotchas
 
-- `resolution_scale=4.0` is the VRAM/memory-heavy knob on the 24 GB 4090: a 4x
-  resized frame creates 16x patch count; lower it if forward passes OOM.
+- `resolution_scale=4.0` multiplies the zoom detector's capped view resolution;
+  it creates 16x as many patches before tiling. `max_patches=4096` keeps each
+  tile bounded for the 24 GB 4090. Lower the multiplier if runtime is too high.
 - `center` in `regions_info` is `(x, y)` (column, row) — the OpenCV convention,
   not numpy `(row, col)`; keep this straight when converting to relative point
   prompts for SAM3.

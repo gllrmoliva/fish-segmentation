@@ -9,11 +9,14 @@ guaranteed-interior points (candidate point prompts for SAM3).
 
 1. `load_env()` + `ROOT = find_repo_root()`; pick device.
 2. `load_backbone("facebook/dinov3-vitl16-pretrain-lvd1689m", device)` (gated HF repo — needs `HF_TOKEN`).
-3. `load_sampled_frames(data/test_media/dolphin_00.mp4, n_frames=5)`.
-4. Per frame: `run_dino_detector(..., resolution_scale=4.0)` +
-   `extract_salient_regions(..., method="otsu", min_absolute_pixels=30)`;
-   prints the average regions-per-frame count.
-5. `plot_regions_with_centers(...)` on one result.
+3. Load the configured processed video, falling back to
+   `data/test_media/dolphin_00.mp4` when it is unavailable.
+4. Per frame: `run_zoom_detector(..., long_side=1024,
+   resolution_scale=4.0)`; oversized views are tiled automatically and the
+   average detections-per-frame count is printed.
+5. Run the initial scaled coarse pass once with `run_dino_view()` and display
+   the raw DINO heatmap beside the thresholded mask.
+6. Plot merged detections on the sampled frames.
 
 ## Inputs / outputs
 

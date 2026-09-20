@@ -47,9 +47,18 @@ def test_zoom_roundtrip(monkey_img_size=(2048, 1152)):
     W, H = monkey_img_size
     calls = []
 
-    def fake_dino_pass(image, model, processor, long_side, device, percentile_threshold=99.5):
+    def fake_dino_pass(
+        image,
+        model,
+        processor,
+        long_side,
+        device,
+        percentile_threshold=99.5,
+        resolution_scale=1.0,
+        max_patches=4096,
+    ):
         w, h = image.size
-        calls.append((image.size, long_side))
+        calls.append((image.size, long_side, resolution_scale, max_patches))
         mask = np.zeros((h, w), np.uint8)
         # blob at normalized (0.5, 0.5) of THIS view
         cx, cy = w // 2, h // 2
@@ -62,17 +71,23 @@ def test_zoom_roundtrip(monkey_img_size=(2048, 1152)):
     d._dino_pass = fake_dino_pass
     try:
         img = Image.new("RGB", (W, H))
-        results = run_zoom_detector(img, model=None, processor=None, long_side=1024)
+        results = run_zoom_detector(
+            img,
+            model=None,
+            processor=None,
+            long_side=1024,
+            resolution_scale=4.0,
+        )
     finally:
         d._dino_pass = orig
 
     assert calls, "no dino passes"
     # first view: full frame, fed downscaled to long_side 1024
-    assert calls[0] == ((W, H), 1024), calls[0]
+    assert calls[0] == ((W, H), 1024, 4.0, 4096), calls[0]
     # level-0 blob found -> one zoom -> native 16x16 crop <= 1024 -> recursion stops
     assert len(calls) == 2 and max(calls[1][0]) <= 1024, calls
     # zoom happened (>= 2 levels) OR stopped because view was native<=1024
-    print(f"{len(calls)} passes; sizes: {[s for s, _ in calls]}")
+    print(f"{len(calls)} passes; sizes: {[call[0] for call in calls]}")
     # center-of-frame blob maps back to normalized ~ (0.5, 0.5)
     best = min(results, key=lambda p: (p["x"] - 0.5) ** 2 + (p["y"] - 0.5) ** 2)
     assert abs(best["x"] - 0.5) < 0.02 and abs(best["y"] - 0.5) < 0.02, best

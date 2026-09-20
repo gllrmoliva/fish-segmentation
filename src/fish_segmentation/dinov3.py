@@ -9,6 +9,11 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
 
 
+PATCH_SIZE = 16
+DEFAULT_MAX_PATCHES = 4096
+DEFAULT_TILE_OVERLAP = 0.25
+
+
 def remove_letterbox(image: Image.Image, threshold: float = 0.04) -> Image.Image:
     """Detects and crops uniform black letterbox borders from a PIL image."""
     gray = np.array(image.convert("L"), dtype=np.float32)
@@ -23,24 +28,39 @@ def remove_letterbox(image: Image.Image, threshold: float = 0.04) -> Image.Image
     return image
 
 
+def _scaled_patch_shape(
+    image_size: Tuple[int, int], scale: float, patch_size: int = PATCH_SIZE
+) -> Tuple[int, int]:
+    """Returns the patch grid after scaling an image to patch-aligned dimensions."""
+    if scale <= 0:
+        raise ValueError("scale must be greater than zero")
+    if patch_size <= 0:
+        raise ValueError("patch_size must be greater than zero")
+
+    orig_w, orig_h = image_size
+    scaled_w = max(patch_size, int(round(orig_w * scale / patch_size)) * patch_size)
+    scaled_h = max(patch_size, int(round(orig_h * scale / patch_size)) * patch_size)
+    return scaled_h // patch_size, scaled_w // patch_size
+
+
 def prepare_scaled_tensor(
     image: Image.Image,
     processor: AutoImageProcessor,
     scale: float = 4.0,
-    patch_size: int = 16,
+    patch_size: int = PATCH_SIZE,
     device: str = "cuda",
 ) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]:
     """Rescales an image to a patch-aligned resolution and prepares pixel tensors."""
     orig_w, orig_h = image.size
-    scaled_w = int(round(orig_w * scale / patch_size) * patch_size)
-    scaled_h = int(round(orig_h * scale / patch_size) * patch_size)
+    h_patches, w_patches = _scaled_patch_shape(
+        image.size, scale=scale, patch_size=patch_size
+    )
+    scaled_w = w_patches * patch_size
+    scaled_h = h_patches * patch_size
 
     scaled_img = image.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
     inputs = processor(images=scaled_img, do_resize=False, return_tensors="pt")
     pixel_values = inputs["pixel_values"].to(device)
-
-    h_patches = scaled_h // patch_size
-    w_patches = scaled_w // patch_size
 
     return pixel_values, (h_patches, w_patches), (orig_w, orig_h)
 
@@ -82,7 +102,7 @@ def compute_anomaly_heatmap(
 
     # Contrast against sampled reference pool to avoid O(N^2) memory bottlenecks
     if num_patches > (max_sample_pool * 2):
-        sample_idx = torch.randperm(num_patches)[:max_sample_pool]
+        sample_idx = torch.randperm(num_patches, device=tokens.device)[:max_sample_pool]
         similarity_matrix = torch.matmul(tokens, tokens[sample_idx].T)
     else:
         similarity_matrix = torch.matmul(tokens, tokens.T)
@@ -117,6 +137,156 @@ def compute_anomaly_heatmap(
         upsampled.max() - upsampled.min() + 1e-8
     )
     return norm_score
+
+
+def _patch_count(image_size: Tuple[int, int], scale: float) -> int:
+    h_patches, w_patches = _scaled_patch_shape(image_size, scale)
+    return h_patches * w_patches
+
+
+def _view_scale(image: Image.Image, long_side: int, resolution_scale: float) -> float:
+    """Combines the coarse-view cap with a relative resolution multiplier."""
+    if long_side <= 0:
+        raise ValueError("long_side must be greater than zero")
+    if resolution_scale <= 0:
+        raise ValueError("resolution_scale must be greater than zero")
+
+    return min(1.0, long_side / max(image.size)) * resolution_scale
+
+
+def _tile_starts(length: int, tile_size: int, overlap: float) -> List[int]:
+    if not 0 <= overlap < 1:
+        raise ValueError("tile overlap must be in the range [0, 1)")
+    if tile_size >= length:
+        return [0]
+
+    step = max(1, int(round(tile_size * (1 - overlap))))
+    starts = list(range(0, length - tile_size + 1, step))
+    final_start = length - tile_size
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts
+
+
+def _tile_size_for_scale(scale: float, max_patches: int) -> int:
+    """Chooses a square native-image tile whose scaled grid fits the patch budget."""
+    if max_patches <= 0:
+        raise ValueError("max_patches must be greater than zero")
+
+    scaled_side = max(PATCH_SIZE, int(np.sqrt(max_patches)) * PATCH_SIZE)
+    tile_size = max(
+        PATCH_SIZE,
+        int(scaled_side / scale) // PATCH_SIZE * PATCH_SIZE,
+    )
+    while (
+        tile_size > PATCH_SIZE
+        and _patch_count((tile_size, tile_size), scale) > max_patches
+    ):
+        tile_size -= PATCH_SIZE
+    return tile_size
+
+
+def _run_dino_heatmap(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    scale: float,
+    device: str,
+) -> np.ndarray:
+    pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
+        image, processor, scale=scale, device=device
+    )
+    tokens = extract_patch_tokens(model, pixel_values, num_patches=h_patches * w_patches)
+    return compute_anomaly_heatmap(
+        tokens, grid_shape=(h_patches, w_patches), target_shape=orig_shape
+    )
+
+
+def _tiled_dino_heatmap(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    scale: float,
+    device: str,
+    max_patches: int,
+    tile_overlap: float = DEFAULT_TILE_OVERLAP,
+) -> np.ndarray:
+    """Computes a high-resolution heatmap by averaging overlapping tile scores."""
+    width, height = image.size
+    tile_size = _tile_size_for_scale(scale, max_patches)
+    x_starts = _tile_starts(width, tile_size, tile_overlap)
+    y_starts = _tile_starts(height, tile_size, tile_overlap)
+
+    score_sum = np.zeros((height, width), dtype=np.float32)
+    score_count = np.zeros((height, width), dtype=np.float32)
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            x1, y1 = min(width, x0 + tile_size), min(height, y0 + tile_size)
+            tile = image.crop((x0, y0, x1, y1))
+            try:
+                tile_score = _run_dino_heatmap(
+                    tile, model, processor, scale=scale, device=device
+                )
+            except torch.cuda.OutOfMemoryError:
+                if torch.device(device).type != "cuda" or max_patches <= 1:
+                    raise
+                torch.cuda.empty_cache()
+                return _tiled_dino_heatmap(
+                    image,
+                    model,
+                    processor,
+                    scale=scale,
+                    device=device,
+                    max_patches=max(1, max_patches // 2),
+                    tile_overlap=tile_overlap,
+                )
+            score_sum[y0:y1, x0:x1] += tile_score
+            score_count[y0:y1, x0:x1] += 1.0
+
+    return score_sum / np.maximum(score_count, 1.0)
+
+
+def _compute_dino_heatmap(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    scale: float,
+    device: str,
+    max_patches: int = DEFAULT_MAX_PATCHES,
+    tile_overlap: float = DEFAULT_TILE_OVERLAP,
+) -> np.ndarray:
+    """Runs one DINO view directly or in tiles when its patch grid is too large."""
+    if max_patches <= 0:
+        raise ValueError("max_patches must be greater than zero")
+
+    patch_count = _patch_count(image.size, scale)
+    if patch_count > max_patches:
+        return _tiled_dino_heatmap(
+            image,
+            model,
+            processor,
+            scale=scale,
+            device=device,
+            max_patches=max_patches,
+            tile_overlap=tile_overlap,
+        )
+
+    try:
+        return _run_dino_heatmap(image, model, processor, scale=scale, device=device)
+    except torch.cuda.OutOfMemoryError:
+        if torch.device(device).type != "cuda":
+            raise
+        torch.cuda.empty_cache()
+        return _tiled_dino_heatmap(
+            image,
+            model,
+            processor,
+            scale=scale,
+            device=device,
+            max_patches=max(1, max_patches // 2),
+            tile_overlap=tile_overlap,
+        )
 
 
 def segment_anomalies(
@@ -253,6 +423,7 @@ def run_dino_detector(
     percentile_threshold: float = 99.5,
     visualize: bool = True,
     device: Optional[str] = None,
+    max_patches: int = DEFAULT_MAX_PATCHES,
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
     """
     End-to-end execution pipeline for ViT-based anomaly segmentation.
@@ -262,15 +433,13 @@ def run_dino_detector(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     cropped_img = remove_letterbox(raw_image)
-    pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
-        cropped_img, processor, scale=resolution_scale, device=device
-    )
-
-    tokens = extract_patch_tokens(
-        model, pixel_values, num_patches=h_patches * w_patches
-    )
-    norm_score = compute_anomaly_heatmap(
-        tokens, grid_shape=(h_patches, w_patches), target_shape=orig_shape
+    norm_score = _compute_dino_heatmap(
+        cropped_img,
+        model,
+        processor,
+        scale=resolution_scale,
+        device=device,
+        max_patches=max_patches,
     )
     final_mask = segment_anomalies(
         norm_score, percentile_threshold=percentile_threshold
@@ -286,19 +455,50 @@ def _dino_pass(
     long_side: int,
     device: str,
     percentile_threshold: float = 99.5,
+    resolution_scale: float = 1.0,
+    max_patches: int = DEFAULT_MAX_PATCHES,
 ) -> np.ndarray:
     """Runs DINO on one image view; returns binary anomaly mask at native image size."""
-    orig_w, orig_h = image.size
-    # ponytail: never upscales coarse views; native views feed at scale=1.0
-    scale = min(1.0, long_side / max(orig_w, orig_h))
-    pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
-        image, processor, scale=scale, device=device
-    )
-    tokens = extract_patch_tokens(model, pixel_values, num_patches=h_patches * w_patches)
-    norm_score = compute_anomaly_heatmap(
-        tokens, grid_shape=(h_patches, w_patches), target_shape=orig_shape
+    scale = _view_scale(image, long_side, resolution_scale)
+    norm_score = _compute_dino_heatmap(
+        image,
+        model,
+        processor,
+        scale=scale,
+        device=device,
+        max_patches=max_patches,
     )
     return segment_anomalies(norm_score, percentile_threshold=percentile_threshold)
+
+
+def run_dino_view(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    long_side: int = 1024,
+    resolution_scale: float = 1.0,
+    percentile_threshold: float = 99.5,
+    device: Optional[str] = None,
+    max_patches: int = DEFAULT_MAX_PATCHES,
+) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+    """Runs one zoom-compatible DINO view and returns its mask and heatmap."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cropped_img = remove_letterbox(image)
+    scale = _view_scale(cropped_img, long_side, resolution_scale)
+    norm_score = _compute_dino_heatmap(
+        cropped_img,
+        model,
+        processor,
+        scale=scale,
+        device=device,
+        max_patches=max_patches,
+    )
+    final_mask = segment_anomalies(
+        norm_score, percentile_threshold=percentile_threshold
+    )
+    return final_mask, norm_score, cropped_img
 
 
 def _interest_zones(
@@ -375,11 +575,15 @@ def run_zoom_detector(
     percentile_threshold: float = 99.5,
     max_levels: int = 4,
     device: Optional[str] = None,
+    resolution_scale: float = 1.0,
+    max_patches: int = DEFAULT_MAX_PATCHES,
 ) -> List[Dict]:
     """
-    Coarse-to-fine zoom detection: DINO on a <=long_side view, crop interest
-    zones from the ORIGINAL pixels, re-detect, repeat until the view is native
-    and <=long_side. Points are merged across levels and returned normalized.
+    Coarse-to-fine zoom detection with an optional relative resolution multiplier.
+    DINO runs on a <=long_side view, multiplied by resolution_scale, then crops
+    interest zones from the ORIGINAL pixels and re-detects until the view is
+    native and <=long_side. Oversized scaled views are processed in overlapping
+    tiles. Points are merged across levels and returned normalized.
 
     Returns list of dicts with keys:
         - 'x', 'y': normalized [0,1] center in original-image coords.
@@ -399,6 +603,8 @@ def run_zoom_detector(
         mask = _dino_pass(
             img, model, processor, long_side, device,
             percentile_threshold=percentile_threshold,
+            resolution_scale=resolution_scale,
+            max_patches=max_patches,
         )
         _, regions = extract_salient_regions(
             mask, min_absolute_pixels=min_object_pixels
@@ -417,6 +623,49 @@ def run_zoom_detector(
         {"x": x / W, "y": y / H, "radius": r / max(W, H), "level": lvl}
         for x, y, r, lvl in _merge_points(points)
     ]
+
+
+def plot_detection_results(
+    image: Image.Image,
+    norm_score: np.ndarray,
+    final_mask: np.ndarray,
+    overlay_color: Tuple[int, int, int] = (255, 30, 30),
+    alpha: float = 0.5,
+) -> None:
+    """Plots the input, DINO anomaly heatmap, and thresholded mask.
+
+    ``norm_score`` is the raw normalized anomaly signal before thresholding. This
+    view helps distinguish a weak model signal from an overly aggressive mask
+    or connected-component filter.
+    """
+    image_array = np.asarray(image.convert("RGB"))
+    expected_shape = image_array.shape[:2]
+    if norm_score.shape != expected_shape or final_mask.shape != expected_shape:
+        raise ValueError(
+            "image, norm_score, and final_mask must have matching spatial shapes"
+        )
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    axes[0].imshow(image_array)
+    axes[0].set_title("Input")
+    axes[0].axis("off")
+
+    heatmap = axes[1].imshow(norm_score, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1].set_title("DINO anomaly heatmap")
+    axes[1].axis("off")
+    fig.colorbar(heatmap, ax=axes[1], fraction=0.046, pad=0.04)
+
+    overlay = image_array.copy()
+    overlay[final_mask > 0] = overlay_color
+    blended = cv2.addWeighted(image_array, 1 - alpha, overlay, alpha, 0)
+    axes[2].imshow(blended)
+    mask_pixels = int(np.count_nonzero(final_mask))
+    axes[2].set_title(f"Thresholded mask ({mask_pixels:,} pixels)")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_regions_with_centers(
