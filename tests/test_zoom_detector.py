@@ -82,6 +82,7 @@ def test_zoom_trace_records_views():
         percentile_threshold=99.5,
         resolution_scale=1.0,
         max_patches=4096,
+        options=None,
         trace=None,
     ):
         w, h = image.size
@@ -139,6 +140,7 @@ def test_zoom_roundtrip(monkey_img_size=(2048, 1152)):
         percentile_threshold=99.5,
         resolution_scale=1.0,
         max_patches=4096,
+        options=None,
     ):
         w, h = image.size
         calls.append((image.size, long_side, resolution_scale, max_patches))

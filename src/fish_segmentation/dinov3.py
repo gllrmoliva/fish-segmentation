@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import cv2
@@ -12,6 +13,25 @@ from transformers import AutoImageProcessor, AutoModel
 PATCH_SIZE = 16
 DEFAULT_MAX_PATCHES = 4096
 DEFAULT_TILE_OVERLAP = 0.25
+
+
+@dataclass(frozen=True)
+class AnomalyOptions:
+    """Score and mask knobs shared by the end-to-end detectors.
+
+    Defaults are the A/B-validated pipeline: mean-similarity heatmap + hysteresis
+    mask. The original adaptive mask is still reachable with
+    ``mask_method="adaptive"``, and ``score_mode="knn"`` / local contrast are
+    opt-in alternatives (see ``notebooks/08_dinov3_heatmap_ab.ipynb``).
+    """
+
+    score_mode: Literal["mean", "knn"] = "mean"
+    knn_k: int = 5
+    local_contrast_strength: float = 0.0
+    local_contrast_sigma_pct: float = 0.05
+    mask_method: Literal["adaptive", "hysteresis"] = "hysteresis"
+    low_percentile: float = 98.0
+    closing_kernel_size: int = 0
 
 
 def remove_letterbox(image: Image.Image, threshold: float = 0.04) -> Image.Image:
@@ -85,6 +105,25 @@ def extract_patch_tokens(
     return F.normalize(tokens, p=2, dim=-1)
 
 
+def _local_contrast(
+    scores: np.ndarray, strength: float, sigma_pct: float
+) -> np.ndarray:
+    """High-passes a score map to flatten broad halos around peaks.
+
+    The single-pass path applies it to the patch grid before border suppression
+    and upsampling (the border fill cannot blur into a bright rim and sigma stays
+    in patch units); the tiled path applies it once to the stitched map.
+    """
+    if strength <= 0:
+        return scores
+    if sigma_pct <= 0:
+        raise ValueError("local_contrast_sigma_pct must be greater than zero")
+
+    sigma = max(1.0, sigma_pct * max(scores.shape))
+    background = cv2.GaussianBlur(scores.astype(np.float32), (0, 0), sigma)
+    return scores - strength * background
+
+
 def compute_anomaly_heatmap(
     tokens: torch.Tensor,
     grid_shape: Tuple[int, int],
@@ -92,6 +131,10 @@ def compute_anomaly_heatmap(
     max_sample_pool: int = 1500,
     border_margin_pct: float = 0.05,
     normalize: bool = True,
+    score_mode: Literal["mean", "knn"] = "mean",
+    knn_k: int = 5,
+    local_contrast_strength: float = 0.0,
+    local_contrast_sigma_pct: float = 0.05,
 ) -> np.ndarray:
     """
     Calculates cosine-distance anomaly scores, suppresses border tokens,
@@ -101,7 +144,28 @@ def compute_anomaly_heatmap(
         normalize: min-max scale the result to [0, 1]. Tiling passes False so
             raw scores from different tiles stay comparable; the stitched map is
             normalized once at the end.
+        score_mode: 'mean' uses 1 - mean similarity against the reference pool.
+            'knn' uses 1 - mean of the top-k similarities instead: water repeats
+            everywhere so it keeps close neighbours, while object patches do not,
+            which fills the object interior instead of ringing around it.
+        knn_k: nearest references averaged per patch in 'knn' mode.
+        local_contrast_strength: >0 subtracts that multiple of a Gaussian-blurred
+            copy of the grid scores (unsharp/high-pass), flattening the warm halo
+            that surrounds the hottest patches. 0 disables it.
+        local_contrast_sigma_pct: blur sigma as a fraction of the longer grid
+            side; only used when local_contrast_strength > 0. A small sigma
+            (~0.05) removes the mid-scale halo and is meant for the coarse view /
+            heatmap inspection; a large sigma (~0.25) only removes the
+            very-low-frequency positional fog and survives the zoom recursion
+            (objects bigger than the blur are not hollowed into rings).
     """
+    if score_mode not in ("mean", "knn"):
+        raise ValueError("score_mode must be 'mean' or 'knn'")
+    if knn_k <= 0:
+        raise ValueError("knn_k must be greater than zero")
+    if local_contrast_strength < 0:
+        raise ValueError("local_contrast_strength must be non-negative")
+
     h_patches, w_patches = grid_shape
     num_patches = h_patches * w_patches
     orig_w, orig_h = target_shape
@@ -119,13 +183,23 @@ def compute_anomaly_heatmap(
     else:
         similarity_matrix = torch.matmul(tokens, tokens.T)
 
-    mean_sim = similarity_matrix.mean(dim=1)
-    anomaly_scores = (1.0 - mean_sim).reshape(h_patches, w_patches)
+    if score_mode == "knn":
+        k = min(knn_k, similarity_matrix.shape[1])
+        anomaly_scores = (1.0 - similarity_matrix.topk(k, dim=1).values.mean(dim=1))
+    else:
+        anomaly_scores = 1.0 - similarity_matrix.mean(dim=1)
+    anomaly_scores = anomaly_scores.reshape(h_patches, w_patches)
+
+    grid_scores = _local_contrast(
+        anomaly_scores.detach().cpu().numpy(),
+        strength=local_contrast_strength,
+        sigma_pct=local_contrast_sigma_pct,
+    )
 
     # ViT border artifact suppression
     border_y = max(1, int(h_patches * border_margin_pct))
     border_x = max(1, int(w_patches * border_margin_pct))
-    clean_scores = anomaly_scores.clone()
+    clean_scores = grid_scores.copy()
     fill_val = clean_scores.min()
 
     clean_scores[:border_y, :] = fill_val
@@ -134,7 +208,9 @@ def compute_anomaly_heatmap(
     clean_scores[:, -border_x:] = fill_val
 
     # Upsample to target spatial dimensions
-    anomaly_tensor = clean_scores.unsqueeze(0).unsqueeze(0)
+    anomaly_tensor = torch.as_tensor(clean_scores, dtype=torch.float32).unsqueeze(
+        0
+    ).unsqueeze(0)
     upsampled = (
         F.interpolate(
             anomaly_tensor, size=(orig_h, orig_w), mode="bicubic", align_corners=False
@@ -208,6 +284,10 @@ def _run_dino_heatmap(
     scale: float,
     device: str,
     normalize: bool = True,
+    score_mode: Literal["mean", "knn"] = "mean",
+    knn_k: int = 5,
+    local_contrast_strength: float = 0.0,
+    local_contrast_sigma_pct: float = 0.05,
 ) -> np.ndarray:
     pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
         image, processor, scale=scale, device=device
@@ -218,6 +298,10 @@ def _run_dino_heatmap(
         grid_shape=(h_patches, w_patches),
         target_shape=orig_shape,
         normalize=normalize,
+        score_mode=score_mode,
+        knn_k=knn_k,
+        local_contrast_strength=local_contrast_strength,
+        local_contrast_sigma_pct=local_contrast_sigma_pct,
     )
 
 
@@ -260,6 +344,10 @@ def _tiled_dino_heatmap(
     device: str,
     max_patches: int,
     tile_overlap: float = DEFAULT_TILE_OVERLAP,
+    score_mode: Literal["mean", "knn"] = "mean",
+    knn_k: int = 5,
+    local_contrast_strength: float = 0.0,
+    local_contrast_sigma_pct: float = 0.05,
 ) -> np.ndarray:
     """Computes a high-resolution heatmap from overlapping tiles.
 
@@ -272,6 +360,10 @@ def _tiled_dino_heatmap(
     feather (so overlap-count steps cannot show as seams) and min-max normalized
     once at the end. Tiles whose shape appears only once (degenerate views) keep
     their raw scores.
+
+    Local contrast is applied to the stitched map, never per tile: high-passing
+    each tile amplifies its own water texture and destroys cross-tile
+    comparability, which surface as scattered specks after stitching.
     """
     width, height = image.size
     tile_size = _tile_size_for_scale(scale, max_patches)
@@ -287,7 +379,14 @@ def _tiled_dino_heatmap(
             tile = image.crop((x0, y0, x1, y1))
             try:
                 tile_score = _run_dino_heatmap(
-                    tile, model, processor, scale=scale, device=device, normalize=False
+                    tile,
+                    model,
+                    processor,
+                    scale=scale,
+                    device=device,
+                    normalize=False,
+                    score_mode=score_mode,
+                    knn_k=knn_k,
                 )
             except torch.cuda.OutOfMemoryError:
                 if torch.device(device).type != "cuda" or max_patches <= 1:
@@ -301,6 +400,10 @@ def _tiled_dino_heatmap(
                     device=device,
                     max_patches=max(1, max_patches // 2),
                     tile_overlap=tile_overlap,
+                    score_mode=score_mode,
+                    knn_k=knn_k,
+                    local_contrast_strength=local_contrast_strength,
+                    local_contrast_sigma_pct=local_contrast_sigma_pct,
                 )
             tiles.append((x0, y0, tile_score))
 
@@ -324,6 +427,11 @@ def _tiled_dino_heatmap(
         weight_sum[y0:y0 + th, x0:x0 + tw] += weight
 
     stitched = score_sum / np.maximum(weight_sum, 1e-6)
+    stitched = _local_contrast(
+        stitched,
+        strength=local_contrast_strength,
+        sigma_pct=local_contrast_sigma_pct,
+    )
     span = float(stitched.max() - stitched.min())
     if span < 1e-6:
         return np.zeros_like(stitched)
@@ -338,11 +446,21 @@ def _compute_dino_heatmap(
     device: str,
     max_patches: int = DEFAULT_MAX_PATCHES,
     tile_overlap: float = DEFAULT_TILE_OVERLAP,
+    score_mode: Literal["mean", "knn"] = "mean",
+    knn_k: int = 5,
+    local_contrast_strength: float = 0.0,
+    local_contrast_sigma_pct: float = 0.05,
 ) -> np.ndarray:
     """Runs one DINO view directly or in tiles when its patch grid is too large."""
     if max_patches <= 0:
         raise ValueError("max_patches must be greater than zero")
 
+    heatmap_kwargs = {
+        "score_mode": score_mode,
+        "knn_k": knn_k,
+        "local_contrast_strength": local_contrast_strength,
+        "local_contrast_sigma_pct": local_contrast_sigma_pct,
+    }
     patch_count = _patch_count(image.size, scale)
     if patch_count > max_patches:
         return _tiled_dino_heatmap(
@@ -353,10 +471,13 @@ def _compute_dino_heatmap(
             device=device,
             max_patches=max_patches,
             tile_overlap=tile_overlap,
+            **heatmap_kwargs,
         )
 
     try:
-        return _run_dino_heatmap(image, model, processor, scale=scale, device=device)
+        return _run_dino_heatmap(
+            image, model, processor, scale=scale, device=device, **heatmap_kwargs
+        )
     except torch.cuda.OutOfMemoryError:
         if torch.device(device).type != "cuda":
             raise
@@ -369,7 +490,27 @@ def _compute_dino_heatmap(
             device=device,
             max_patches=max(1, max_patches // 2),
             tile_overlap=tile_overlap,
+            **heatmap_kwargs,
         )
+
+
+def _grow_seeds(seeds: np.ndarray, low_mask: np.ndarray) -> np.ndarray:
+    """Hysteresis growth: keeps low-threshold components that contain a seed.
+
+    Equivalent to morphological reconstruction of ``low_mask`` from ``seeds``,
+    done with connected components so long thin bridges connect exactly.
+    """
+    num_labels, labels = cv2.connectedComponents(
+        low_mask.astype(np.uint8), connectivity=8
+    )
+    if num_labels <= 1:
+        return np.zeros_like(low_mask, dtype=np.uint8)
+
+    seed_labels = np.unique(labels[seeds > 0])
+    seed_labels = seed_labels[seed_labels > 0]
+    if seed_labels.size == 0:
+        return np.zeros_like(low_mask, dtype=np.uint8)
+    return np.isin(labels, seed_labels).astype(np.uint8)
 
 
 def segment_anomalies(
@@ -377,19 +518,62 @@ def segment_anomalies(
     percentile_threshold: float = 99.5,
     adaptive_block_size: int = 21,
     morph_kernel_size: int = 3,
+    method: Literal["adaptive", "hysteresis"] = "hysteresis",
+    low_percentile: float = 98.0,
+    closing_kernel_size: int = 0,
 ) -> np.ndarray:
-    """Applies global percentile filtering, local adaptive edge matching, and morphology."""
+    """Builds the anomaly mask with global percentile filtering and morphology.
 
-    # Top-tail percentile mask
-    threshold_val = np.percentile(norm_score, percentile_threshold)
-    binary_mask = (norm_score >= threshold_val).astype(np.uint8) * 255
+    Args:
+        method: 'hysteresis' (default) seeds with the top percentile and grows
+            every seed through the connected region above ``low_percentile`` —
+            one connected component per object instead of a fragmented core,
+            without flooding the whole warm halo. 'adaptive' is the original
+            top-percentile mask ANDed with a local adaptive-threshold mask; its
+            local core can be empty on large frames (smooth peaks never beat
+            their own 21 px window mean), so it misses whole frames.
+        low_percentile: lower growth threshold for 'hysteresis'
+            (0 < low_percentile <= percentile_threshold).
+        closing_kernel_size: optional morphological closing (ellipse, px) before
+            the final opening; bridges small gaps between fragments. 0 disables.
+    """
+    if method not in ("adaptive", "hysteresis"):
+        raise ValueError("method must be 'adaptive' or 'hysteresis'")
+    if closing_kernel_size < 0:
+        raise ValueError("closing_kernel_size must be non-negative")
 
-    # Local adaptive contrast refinement
-    roi = (norm_score * 255).astype(np.uint8)
-    core_mask = cv2.adaptiveThreshold(
-        roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, adaptive_block_size, -2
-    )
-    fine_mask = cv2.bitwise_and(binary_mask, core_mask)
+    if method == "hysteresis":
+        if not 0 < low_percentile <= percentile_threshold <= 100:
+            raise ValueError(
+                "percentiles must satisfy 0 < low_percentile <= percentile_threshold <= 100"
+            )
+        high_val = np.percentile(norm_score, percentile_threshold)
+        low_val = np.percentile(norm_score, low_percentile)
+        seeds = (norm_score >= high_val).astype(np.uint8)
+        low_mask = (norm_score >= low_val).astype(np.uint8)
+        fine_mask = _grow_seeds(seeds, low_mask) * 255
+
+        if closing_kernel_size > 1:
+            close_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (closing_kernel_size, closing_kernel_size)
+            )
+            fine_mask = cv2.morphologyEx(fine_mask, cv2.MORPH_CLOSE, close_kernel)
+    else:
+        # Top-tail percentile mask
+        threshold_val = np.percentile(norm_score, percentile_threshold)
+        binary_mask = (norm_score >= threshold_val).astype(np.uint8) * 255
+
+        # Local adaptive contrast refinement
+        roi = (norm_score * 255).astype(np.uint8)
+        core_mask = cv2.adaptiveThreshold(
+            roi,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            adaptive_block_size,
+            -2,
+        )
+        fine_mask = cv2.bitwise_and(binary_mask, core_mask)
 
     # Morphological noise removal
     kernel = cv2.getStructuringElement(
@@ -507,6 +691,7 @@ def run_dino_detector(
     visualize: bool = True,
     device: Optional[str] = None,
     max_patches: int = DEFAULT_MAX_PATCHES,
+    options: AnomalyOptions = AnomalyOptions(),
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
     """
     End-to-end execution pipeline for ViT-based anomaly segmentation.
@@ -523,9 +708,17 @@ def run_dino_detector(
         scale=resolution_scale,
         device=device,
         max_patches=max_patches,
+        score_mode=options.score_mode,
+        knn_k=options.knn_k,
+        local_contrast_strength=options.local_contrast_strength,
+        local_contrast_sigma_pct=options.local_contrast_sigma_pct,
     )
     final_mask = segment_anomalies(
-        norm_score, percentile_threshold=percentile_threshold
+        norm_score,
+        percentile_threshold=percentile_threshold,
+        method=options.mask_method,
+        low_percentile=options.low_percentile,
+        closing_kernel_size=options.closing_kernel_size,
     )
 
     return final_mask, norm_score, cropped_img
@@ -540,6 +733,7 @@ def _dino_pass(
     percentile_threshold: float = 99.5,
     resolution_scale: float = 1.0,
     max_patches: int = DEFAULT_MAX_PATCHES,
+    options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[Dict] = None,
 ) -> np.ndarray:
     """Runs DINO on one image view; returns binary anomaly mask at native image size.
@@ -556,11 +750,21 @@ def _dino_pass(
         scale=scale,
         device=device,
         max_patches=max_patches,
+        score_mode=options.score_mode,
+        knn_k=options.knn_k,
+        local_contrast_strength=options.local_contrast_strength,
+        local_contrast_sigma_pct=options.local_contrast_sigma_pct,
     )
     if trace is not None:
         trace["scale"] = scale
         trace["norm_score"] = norm_score
-    return segment_anomalies(norm_score, percentile_threshold=percentile_threshold)
+    return segment_anomalies(
+        norm_score,
+        percentile_threshold=percentile_threshold,
+        method=options.mask_method,
+        low_percentile=options.low_percentile,
+        closing_kernel_size=options.closing_kernel_size,
+    )
 
 
 def run_dino_view(
@@ -572,6 +776,7 @@ def run_dino_view(
     percentile_threshold: float = 99.5,
     device: Optional[str] = None,
     max_patches: int = DEFAULT_MAX_PATCHES,
+    options: AnomalyOptions = AnomalyOptions(),
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
     """Runs one zoom-compatible DINO view and returns its mask and heatmap."""
     if device is None:
@@ -586,9 +791,17 @@ def run_dino_view(
         scale=scale,
         device=device,
         max_patches=max_patches,
+        score_mode=options.score_mode,
+        knn_k=options.knn_k,
+        local_contrast_strength=options.local_contrast_strength,
+        local_contrast_sigma_pct=options.local_contrast_sigma_pct,
     )
     final_mask = segment_anomalies(
-        norm_score, percentile_threshold=percentile_threshold
+        norm_score,
+        percentile_threshold=percentile_threshold,
+        method=options.mask_method,
+        low_percentile=options.low_percentile,
+        closing_kernel_size=options.closing_kernel_size,
     )
     return final_mask, norm_score, cropped_img
 
@@ -727,6 +940,7 @@ def run_zoom_detector(
     max_patches: int = DEFAULT_MAX_PATCHES,
     merge_gap: float = 0.0,
     min_zone_fraction: float = 0.0,
+    options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """
@@ -741,6 +955,9 @@ def run_zoom_detector(
     are fused into one zone so a single DINO pass sees several nearby objects,
     and every zone is grown to at least ``min_zone_fraction`` of the long side.
     The defaults (0) keep the original per-component crops.
+
+    ``options`` bundles the score mode (mean/knn + local contrast) and the mask
+    method (adaptive/hysteresis); see ``AnomalyOptions``.
 
     When ``trace`` is a list, one record per DINO view is appended in depth-first
     order with keys:
@@ -780,6 +997,7 @@ def run_zoom_detector(
             percentile_threshold=percentile_threshold,
             resolution_scale=resolution_scale,
             max_patches=max_patches,
+            options=options,
             **pass_kwargs,
         )
         _, regions = extract_salient_regions(

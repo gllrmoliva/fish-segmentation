@@ -9,7 +9,22 @@ The resulting heatmap → binary mask → connected components yield salient reg
 with a **guaranteed-interior point** (the "pole of inaccessibility") per region —
 meant as point prompts for SAM3.
 
-Driver: `notebooks/03_dinov3_detect.ipynb`.
+Driver: `notebooks/03_dinov3_detect.ipynb` (A/B of the score/mask knobs:
+`notebooks/08_dinov3_heatmap_ab.ipynb`).
+
+## Options (`AnomalyOptions`)
+
+Frozen dataclass bundling the knobs of the end-to-end detectors; its defaults are
+the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
+`run_zoom_detector` all take `options=`.
+
+- `score_mode`: `"mean"` (default) or `"knn"`.
+- `knn_k`: nearest references averaged in `"knn"` mode.
+- `local_contrast_strength`: 0 disables (default); >0 high-passes the score map.
+- `local_contrast_sigma_pct`: blur sigma as a fraction of the longer map side.
+- `mask_method`: `"hysteresis"` (default) or `"adaptive"`.
+- `low_percentile`: growth threshold for hysteresis.
+- `closing_kernel_size`: optional closing before the final opening.
 
 ## Pipeline stages
 
@@ -21,29 +36,42 @@ Driver: `notebooks/03_dinov3_detect.ipynb`.
 3. Tokens: `extract_patch_tokens(model, pixel_values, num_patches)` — forward
    pass, drop leading (CLS/registers) tokens, L2-normalize.
 4. Heatmap: `compute_anomaly_heatmap(tokens, grid_shape, target_shape,
-   max_sample_pool=1500, border_margin_pct=0.05, normalize=True)` — 1 − mean cosine
-   similarity per token (a fixed-seed subsample of the reference pool keeps
-   O(N·1500) instead of O(N²) and makes runs reproducible), border tokens zeroed
-   (ViT border artifact), bicubic upsample to pixels, min-max normalized.
-   `normalize=False` returns raw scores, which tiled stitching uses.
+   max_sample_pool=1500, border_margin_pct=0.05, normalize=True,
+   score_mode="mean", knn_k=5, local_contrast_strength=0.0,
+   local_contrast_sigma_pct=0.05)` — `"mean"` scores 1 − mean cosine similarity
+   per token; `"knn"` scores 1 − mean of the top-k similarities (water repeats
+   everywhere so it keeps close neighbours, object patches do not). A fixed-seed
+   subsample of the reference pool keeps O(N·1500) instead of O(N²) and makes
+   runs reproducible. Local contrast subtracts a Gaussian-blurred copy of the
+   score map (unsharp/high-pass) to flatten the broad warm halo around peaks; it
+   is off by default. Border tokens are then zeroed (ViT border artifact), the
+   map is bicubic-upsampled to pixels and min-max normalized. `normalize=False`
+   returns raw scores, which tiled stitching uses.
 5. Mask: `segment_anomalies(norm_score, percentile_threshold=99.5,
-   adaptive_block_size=21, morph_kernel_size=3)` — top-tail percentile mask
-   ANDed with an adaptive-threshold mask, then morphological opening.
+   adaptive_block_size=21, morph_kernel_size=3, method="hysteresis",
+   low_percentile=98.0, closing_kernel_size=0)`. `"hysteresis"` (default) seeds
+   with the top percentile and keeps every connected component of the
+   lower-percentile mask that holds a seed (morphological reconstruction, done
+   with `cv2.connectedComponents` so long thin bridges connect exactly), then
+   applies the final morphological opening. `"adaptive"` is the legacy
+   top-percentile ∩ local adaptive core.
 6. Regions: `extract_salient_regions(binary_mask, method="otsu"|"iqr",
    iqr_k=1.5, min_absolute_pixels=20)` — connected components (8-connectivity),
    area thresholding (Otsu on log-areas, or IQR outlier rule), and per region:
    `{'label', 'area', 'center': (x, y), 'max_inscribed_radius'}` where `center`
    is the distance-transform maximum (guaranteed inside the component).
 7. End-to-end wrapper: `run_dino_detector(raw_image, model, processor,
-    resolution_scale=4.0, percentile_threshold=99.5, visualize=True, device=None)`
-    → `(final_mask, norm_score, cropped_image)`.
+    resolution_scale=4.0, percentile_threshold=99.5, visualize=True, device=None,
+    options=AnomalyOptions())` → `(final_mask, norm_score, cropped_image)`.
 8. Zoom driver: `run_zoom_detector(..., long_side=1024,
-   resolution_scale=4.0)` applies the multiplier to every coarse and recursive
-   view. Views exceeding the patch budget are split into overlapping tiles and
-   stitched back into native coordinates: each tile's repeating positional bias
-   is estimated by the cross-tile phase mean and subtracted, tiles are blended
-   with a cosine feather, and the result is min-max normalized once.
-   `run_dino_view()` exposes one such view for heatmap diagnostics.
+   resolution_scale=4.0, options=AnomalyOptions())` applies the multiplier to
+   every coarse and recursive view. Views exceeding the patch budget are split
+   into overlapping tiles and stitched back into native coordinates: each tile's
+   repeating positional bias is estimated by the cross-tile phase mean and
+   subtracted, tiles are blended with a cosine feather, and the result is min-max
+   normalized once. Local contrast is applied to the stitched map after the phase
+   mean, never per tile. `run_dino_view()` exposes one such view for heatmap
+   diagnostics.
    Passing `trace=[]` collects one record per view, in depth-first order, with
    `depth`, `origin`, `size`, `scale`, `feed_native`, `norm_score`, `mask`,
    `regions`, `zones` and raw `points` — used by the layer-by-layer notebook.
@@ -65,16 +93,28 @@ Driver: `notebooks/03_dinov3_detect.ipynb`.
 
 ## Gotchas
 
+- The legacy `method="adaptive"` mask ANDs the top percentile with
+  `cv2.adaptiveThreshold(..., C=-2)`, which requires beating the local window
+  mean by 2. On large frames a smooth peak never does, the core comes out empty
+  and **whole frames yield zero regions** (verified on the 4K processed footage
+  at `resolution_scale=1.0`). Hysteresis is percentile-only and has no such
+  failure mode.
+- `low_percentile` tunes the growth: on the tested 4K frames 98 keeps the mask on
+  the animal, 97 grows into water texture at deep zoom levels (false-positive
+  point clusters), 99 barely grows beyond the seeds. It only matters when
+  `method="hysteresis"`.
+- Local contrast sigma: a small sigma (~0.05) removes the mid-scale halo and is
+  meant for heatmap inspection / the coarse view; a large sigma (~0.25) only
+  removes the very-low-frequency positional fog and survives the zoom recursion
+  (objects bigger than the blur are hollowed into rings with a small sigma).
+  It is off by default: with hysteresis it did not change the validated
+  detections but tripled the runtime in the A/B.
+- High-passing each tile separately amplifies per-tile water texture and destroys
+  cross-tile comparability (scattered specks after stitching); `_tiled_dino_heatmap`
+  therefore applies local contrast once to the stitched map.
 - `resolution_scale=4.0` multiplies the zoom detector's capped view resolution;
   it creates 16x as many patches before tiling. `max_patches=4096` keeps each
   tile bounded for the 24 GB 4090. Lower the multiplier if runtime is too high.
-- Tiled heatmaps no longer show the tile grid: each tile is an independent image
-  for the ViT and carries a positional bias (bright borders, dark center) that
-  used to repeat on the lattice. `_tiled_dino_heatmap` estimates that repeating
-  component as the cross-tile phase mean (mean raw score per within-tile
-  position) and subtracts it per tile — no extra model passes — then feathers
-  the overlap. A perfectly flat stitch returns an all-zero map instead of
-  amplifying numerical noise.
 - `center` in `regions_info` is `(x, y)` (column, row) — the OpenCV convention,
   not numpy `(row, col)`; keep this straight when converting to relative point
   prompts for SAM3.
