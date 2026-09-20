@@ -61,7 +61,9 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
   `03_dinov3_detect`, `04_sam3_track` (main SAM3 pipeline), `05_smoke_test`
   (SAM3 constructor-argument reference), `07_dinov3_zoom_levels` (zoom trace),
   `08_dinov3_heatmap_ab` (score/mask A/B), `09_dino_sam_tracking` (DINO points
-  as SAM3 tracker prompts). Outputs go to `notebooks/outputs/` (gitignored).
+  as SAM3 tracker prompts), `10_dino_sam_incremental` (DINO every N frames
+  against the live SAM3 session: new candidates become new masklets mid-video).
+  Outputs go to `notebooks/outputs/` (gitignored).
   `notebooks/reference/sam3_video_predictor.ipynb` is the upstream Meta demo,
   reference only — do not execute or develop in it.
 - `tests/` — CPU-only pytest-suite (heatmap, zoom geometry/merge, SAM3 request

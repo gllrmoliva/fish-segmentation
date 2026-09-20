@@ -27,6 +27,22 @@ def test_compute_anomaly_heatmap_shape_and_range():
     assert np.isclose(heatmap.max(), 1.0)
 
 
+def test_compute_anomaly_heatmap_accepts_bf16_tokens():
+    """DINOv3 checkpoints load in bf16 on GPU; .numpy() needs an fp32 cast first."""
+    torch.manual_seed(0)
+    tokens = F.normalize(torch.randn(30, 8, dtype=torch.bfloat16), p=2, dim=-1)
+
+    heatmap = compute_anomaly_heatmap(
+        tokens,
+        grid_shape=(5, 6),
+        target_shape=(36, 30),
+    )
+
+    assert heatmap.shape == (30, 36)
+    assert heatmap.dtype == np.float32
+    assert np.isfinite(heatmap).all()
+
+
 def test_dino_pass_scales_the_capped_view(monkeypatch):
     captured = {}
 

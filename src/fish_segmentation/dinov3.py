@@ -225,7 +225,7 @@ def compute_anomaly_heatmap(
     anomaly_scores = anomaly_scores.reshape(h_patches, w_patches)
 
     grid_scores = _local_contrast(
-        anomaly_scores.detach().cpu().numpy(),
+        anomaly_scores.detach().float().cpu().numpy(),
         strength=local_contrast_strength,
         sigma_pct=local_contrast_sigma_pct,
     )

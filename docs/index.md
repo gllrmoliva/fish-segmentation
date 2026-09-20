@@ -32,6 +32,9 @@ Support files:
   score-mode/local-contrast and mask-method A/B for the DINO detector.
 - [notebooks/09_dino_sam_tracking.md](notebooks/09_dino_sam_tracking.md) — DINO
   candidate points as SAM3 point prompts + masklet tracking.
+- [notebooks/10_dino_sam_incremental.md](notebooks/10_dino_sam_incremental.md) —
+  DINO every N frames against the live SAM3 session: new candidates are added as
+  new masklets mid-video (backfill + forward) instead of prompting only once.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 
