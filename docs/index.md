@@ -26,6 +26,8 @@ Support files:
 
 - [notebooks/05_smoke_test.md](notebooks/05_smoke_test.md) — SAM3 image model +
   multiplex video predictor constructor-argument reference.
+- [notebooks/07_dinov3_zoom_levels.md](notebooks/07_dinov3_zoom_levels.md) —
+  trace-driven layer-by-layer view of the DINO zoom detector.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 
