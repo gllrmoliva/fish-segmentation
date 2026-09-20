@@ -12,15 +12,18 @@ guaranteed-interior points (candidate point prompts for SAM3).
 3. Load the configured processed video, falling back to
    `data/test_media/dolphin_00.mp4` when it is unavailable.
 4. Per frame: `run_zoom_detector(..., long_side=1024,
-   resolution_scale=4.0)`; oversized views are tiled automatically and the
-   average detections-per-frame count is printed.
+   resolution_scale=4.0)`; oversized views are tiled automatically, points are
+   merged across levels with the deepest-wins rule, and the average
+   detections-per-frame count is printed.
 5. Run the initial scaled coarse pass once with `run_dino_view()` and display
    the raw DINO heatmap beside the thresholded mask.
-6. Plot merged detections on the sampled frames.
+6. Plot merged detections on the sampled frames (coordinates are normalized to
+   the original frame and carry `level`, `n_levels`, `bbox`, `area`, `solidity`,
+   `score_mean`).
 
 ## Inputs / outputs
 
 - Input: a video path (default tracked test media).
-- Output: in-memory `results` list of `(cropped_img, clean_mask, regions)` + plots.
+- Output: in-memory `results` list of `(frame, detections)` + plots.
 
 Details: [dinov3.md](../src/fish_segmentation/dinov3.md).

@@ -3,9 +3,13 @@ import numpy as np
 from PIL import Image
 
 from fish_segmentation.dinov3 import (
+    RawPoint,
     _dino_pass,
     _interest_zones,
     _merge_points,
+    extract_salient_regions,
+    letterbox_box,
+    remove_letterbox,
     run_zoom_detector,
 )
 
@@ -57,15 +61,150 @@ def test_interest_zones_min_size():
 
 
 def test_merge_points():
-    # same object seen at level 1 (finer) and level 0 (coarse) -> one point, finer wins
-    pts = [(100, 100, 10.0, 0), (104, 102, 20.0, 1)]
+    # Same object at level 1 (finer) and level 0 (coarse): the deep region wins
+    # and the coarse one is only absorbed as confirmation (no averaging).
+    pts = [RawPoint(100, 100, 10.0, 0), RawPoint(104, 102, 20.0, 1)]
     merged = _merge_points(pts)
     assert len(merged) == 1, merged
-    x, y, r, lvl = merged[0]
-    assert (x, y) == (102, 101) and r == 20.0 and lvl == 1, merged[0]
-    # two distant objects stay separate
-    assert len(_merge_points([(0, 0, 5, 0), (500, 500, 5, 0)])) == 2
-    print("merge ok:", merged)
+    det = merged[0]
+    assert (det["x"], det["y"]) == (104, 102), det  # real deep center, not (102, 101)
+    assert det["radius"] == 20.0 and det["level"] == 1
+    assert det["n_levels"] == 2 and det["n_points"] == 2 and det["levels"] == (0, 1)
+
+    # a shallow detection matching no deeper cluster survives on its own
+    far = [RawPoint(0, 0, 5.0, 0), RawPoint(500, 500, 5.0, 1)]
+    merged_far = _merge_points(far)
+    assert len(merged_far) == 2, merged_far
+    assert all(d["n_levels"] == 1 for d in merged_far)
+
+    # same-level duplicates cluster around the largest inscribed circle
+    same = [RawPoint(100, 100, 5.0, 1), RawPoint(103, 100, 12.0, 1)]
+    merged_same = _merge_points(same)
+    assert len(merged_same) == 1 and merged_same[0]["radius"] == 12.0, merged_same
+
+    # a wide coarse region confirms a deep point even when its inscribed circle
+    # does not reach it (the center of a hollow/elongated blob can sit far away)
+    wide = [
+        RawPoint(100, 100, 5.0, 0, bbox=(0, 0, 220, 200)),
+        RawPoint(200, 100, 10.0, 1, bbox=(190, 90, 210, 110)),
+    ]
+    merged_wide = _merge_points(wide)
+    assert len(merged_wide) == 1, merged_wide
+    assert merged_wide[0]["level"] == 1 and merged_wide[0]["n_levels"] == 2, merged_wide
+
+    # deterministic under permutation
+    assert _merge_points([pts[1], pts[0]]) == _merge_points(pts)
+
+    # A/B mode: the absorbed coarse detection is emitted as well
+    kept = _merge_points(pts, keep_absorbed=True)
+    assert len(kept) == 2, kept
+    shallow = [d for d in kept if d["level"] == 0]
+    assert len(shallow) == 1
+    assert (shallow[0]["x"], shallow[0]["y"], shallow[0]["radius"]) == (100, 100, 10.0)
+    print("merge ok:", merged, merged_far)
+
+
+def test_extract_salient_regions_metadata():
+    mask = np.zeros((40, 40), np.uint8)
+    mask[10:20, 10:20] = 255  # 10x10 square
+    score = np.zeros((40, 40), np.float32)
+    score[10:20, 10:20] = 0.8
+
+    _, regions = extract_salient_regions(mask, score_map=score)
+    assert len(regions) == 1, regions
+    reg = regions[0]
+    assert reg["bbox"] == (10, 10, 20, 20), reg
+    assert reg["area"] == 100
+    # 10x10 square: r=5 -> area/(pi r^2) = 4/pi
+    assert abs(reg["solidity"] - 4 / np.pi) < 1e-4, reg["solidity"]
+    assert abs(reg["score_mean"] - 0.8) < 1e-6
+    assert abs(reg["score_p95"] - 0.8) < 1e-6
+
+    _, plain = extract_salient_regions(mask)
+    assert "score_mean" not in plain[0]
+    print("region metadata ok:", reg)
+
+
+def test_letterbox_box():
+    arr = np.zeros((80, 100, 3), np.uint8)
+    arr[10:60, 20:90] = 255
+    boxed = Image.fromarray(arr)
+    assert letterbox_box(boxed) == (20, 10, 90, 60)
+    assert remove_letterbox(boxed).size == (70, 50)
+    # all-black falls back to the full image
+    assert letterbox_box(Image.new("RGB", (10, 10))) == (0, 0, 10, 10)
+    print("letterbox ok")
+
+
+def test_zoom_detector_maps_points_to_the_original_frame():
+    """Detections are normalized to the ORIGINAL frame (letterbox offset included)."""
+    arr = np.zeros((120, 200, 3), np.uint8)
+    arr[30:110, 50:180] = 100  # content box (50, 30, 180, 110) -> 130x80
+    image = Image.fromarray(arr)
+
+    def fake_dino_pass(image, model, processor, long_side, device, **kwargs):
+        w, h = image.size
+        mask = np.zeros((h, w), np.uint8)
+        mask[h // 2 - 5 : h // 2 + 5, w // 2 - 5 : w // 2 + 5] = 255
+        return mask, np.zeros((h, w), np.float32)
+
+    import fish_segmentation.dinov3 as d
+
+    orig = d._dino_pass
+    d._dino_pass = fake_dino_pass
+    try:
+        detections = run_zoom_detector(image, model=None, processor=None, long_side=1024)
+    finally:
+        d._dino_pass = orig
+
+    assert len(detections) == 1, detections
+    det = detections[0]
+    # minMaxLoc breaks the 2x2 center tie at the top-left pixel: (64, 39) in view coords
+    assert abs(det["x"] - (50 + 64) / 200) < 1e-6, det
+    assert abs(det["y"] - (30 + 39) / 120) < 1e-6, det
+    assert abs(det["radius"] - 5 / 200) < 1e-6, det
+    assert det["level"] == 0 and det["n_levels"] == 1
+    bx0, by0, _, _ = det["bbox"]
+    assert abs(bx0 - (50 + 60) / 200) < 1e-6 and abs(by0 - (30 + 35) / 120) < 1e-6, det
+    print("original-frame mapping ok:", det)
+
+
+def test_zoom_min_confirmations_filter():
+    """A coarse-only blob is dropped by min_confirmations=2; the refined one stays."""
+    arr = np.full((1152, 2048, 3), 40, np.uint8)
+    arr[576 - 60 : 576 + 60, 1024 - 60 : 1024 + 60] = 200
+    image = Image.fromarray(arr)
+
+    def fake_dino_pass(image, model, processor, long_side, device, **kwargs):
+        w, h = image.size
+        mask = np.zeros((h, w), np.uint8)
+        if max(w, h) > 1024:  # root view: a center blob (will be refined) ...
+            mask[h // 2 - 5 : h // 2 + 5, w // 2 - 5 : w // 2 + 5] = 255
+            mask[5:15, 5:15] = 255  # ... and a corner blob (no deep match)
+        elif np.asarray(image.convert("L")).mean() > 100:  # bright center crop
+            mask[h // 2 - 5 : h // 2 + 5, w // 2 - 5 : w // 2 + 5] = 255
+        return mask, np.zeros((h, w), np.float32)
+
+    import fish_segmentation.dinov3 as d
+
+    orig = d._dino_pass
+    d._dino_pass = fake_dino_pass
+    try:
+        all_dets = run_zoom_detector(
+            image, model=None, processor=None, long_side=1024, min_confirmations=1
+        )
+        confirmed = run_zoom_detector(
+            image, model=None, processor=None, long_side=1024, min_confirmations=2
+        )
+    finally:
+        d._dino_pass = orig
+
+    assert len(all_dets) == 2, all_dets
+    assert sorted(d["n_levels"] for d in all_dets) == [1, 2], all_dets
+    assert len(confirmed) == 1, confirmed
+    assert confirmed[0]["n_levels"] == 2, confirmed
+    assert abs(confirmed[0]["x"] - 0.5) < 0.02 and abs(confirmed[0]["y"] - 0.5) < 0.02
+    print("min_confirmations ok:", confirmed)
 
 
 def test_zoom_trace_records_views():
@@ -92,7 +231,7 @@ def test_zoom_trace_records_views():
             trace["norm_score"] = np.zeros((h, w), np.float32)
         mask = np.zeros((h, w), np.uint8)
         mask[h // 2 - 5 : h // 2 + 5, w // 2 - 5 : w // 2 + 5] = 255
-        return mask
+        return mask, np.zeros((h, w), np.float32)
 
     import fish_segmentation.dinov3 as d
 
@@ -121,6 +260,8 @@ def test_zoom_trace_records_views():
         assert entry["norm_score"].shape == (entry["size"][1], entry["size"][0])
         assert entry["mask"].shape == entry["norm_score"].shape
         assert entry["regions"] and entry["points"]
+        assert entry["points"][0].level == entry["depth"]
+        assert entry["points"][0].bbox is not None
     assert results, results
     print("trace ok:", [entry["size"] for entry in trace], f"{len(results)} point(s)")
 
@@ -148,7 +289,7 @@ def test_zoom_roundtrip(monkey_img_size=(2048, 1152)):
         # blob at normalized (0.5, 0.5) of THIS view
         cx, cy = w // 2, h // 2
         mask[cy - 5 : cy + 5, cx - 5 : cx + 5] = 255
-        return mask
+        return mask, np.zeros((h, w), np.float32)
 
     import fish_segmentation.dinov3 as d
 
@@ -185,6 +326,10 @@ if __name__ == "__main__":
     test_interest_zones_merge_gap()
     test_interest_zones_min_size()
     test_merge_points()
+    test_extract_salient_regions_metadata()
+    test_letterbox_box()
+    test_zoom_detector_maps_points_to_the_original_frame()
+    test_zoom_min_confirmations_filter()
     test_zoom_trace_records_views()
     test_zoom_roundtrip()
     print("ALL OK")

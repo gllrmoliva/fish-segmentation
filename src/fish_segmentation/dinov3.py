@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -34,18 +34,52 @@ class AnomalyOptions:
     closing_kernel_size: int = 0
 
 
-def remove_letterbox(image: Image.Image, threshold: float = 0.04) -> Image.Image:
-    """Detects and crops uniform black letterbox borders from a PIL image."""
+class RawPoint(NamedTuple):
+    """One salient region emitted by a DINO view, in cropped-frame pixels.
+
+    ``x``/``y``/``radius``/``bbox`` are absolute in the letterbox-cropped frame
+    (view origin already added); ``level`` is the recursion depth of the view
+    that emitted it. ``bbox`` is the tight component box, so it can be used as a
+    SAM3 box prompt once normalized. The metadata defaults keep hand-built test
+    points concise.
+    """
+
+    x: int
+    y: int
+    radius: float
+    level: int
+    area: int = 0
+    solidity: float = 0.0
+    score_mean: float = 0.0
+    score_p95: float = 0.0
+    bbox: Optional[Tuple[int, int, int, int]] = None
+
+
+def letterbox_box(
+    image: Image.Image, threshold: float = 0.04
+) -> Tuple[int, int, int, int]:
+    """Returns the (x0, y0, x1, y1) content box of a letterboxed image.
+
+    Falls back to the full image when every pixel is at or below the threshold.
+    Exposed separately from ``remove_letterbox`` so callers that keep the
+    original frame (SAM3 point prompts) can map cropped coordinates back to the
+    video frame.
+    """
     gray = np.array(image.convert("L"), dtype=np.float32)
     if gray.max() > 1.0:
         gray /= 255.0
 
     non_black = np.where(gray > threshold)
-    if non_black[0].size > 0:
-        y_min, y_max = int(non_black[0].min()), int(non_black[0].max())
-        x_min, x_max = int(non_black[1].min()), int(non_black[1].max())
-        return image.crop((x_min, y_min, x_max + 1, y_max + 1))
-    return image
+    if non_black[0].size == 0:
+        return (0, 0, image.size[0], image.size[1])
+    y_min, y_max = int(non_black[0].min()), int(non_black[0].max())
+    x_min, x_max = int(non_black[1].min()), int(non_black[1].max())
+    return (x_min, y_min, x_max + 1, y_max + 1)
+
+
+def remove_letterbox(image: Image.Image, threshold: float = 0.04) -> Image.Image:
+    """Detects and crops uniform black letterbox borders from a PIL image."""
+    return image.crop(letterbox_box(image, threshold))
 
 
 def _scaled_patch_shape(
@@ -587,6 +621,7 @@ def extract_salient_regions(
     method: Literal["otsu", "iqr"] = "otsu",
     iqr_k: float = 1.5,
     min_absolute_pixels: int = 20,
+    score_map: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, List[Dict]]:
     """
     Filtra componentes pequeños... — translated:
@@ -601,6 +636,8 @@ def extract_salient_regions(
                 noise with a few large isolated blobs.
         iqr_k: IQR multiplier (typically 1.5 for standard outliers, 0 for >= Q3).
         min_absolute_pixels: hard pre-filter cutoff for insignificant 1-N pixel artifacts.
+        score_map: optional anomaly heatmap aligned with ``binary_mask``; when
+            given, per-region ``score_mean``/``score_p95`` are added.
 
     Returns:
         filtered_mask: clean mask containing only the selected regions.
@@ -609,6 +646,11 @@ def extract_salient_regions(
             - 'area': area in pixels.
             - 'center': (x, y) coordinates guaranteed to be inside the region.
             - 'max_inscribed_radius': maximum Euclidean distance to the boundary.
+            - 'bbox': tight (x0, y0, x1, y1) component box.
+            - 'solidity': ``area / (pi * r^2)``; ~1 for a disk, ~1.27 for a
+              square, larger for elongated or hollow components.
+            - 'score_mean', 'score_p95': anomaly score stats inside the
+              component (only when ``score_map`` is given).
     """
     mask = (binary_mask > 0).astype(np.uint8) * 255
 
@@ -669,15 +711,22 @@ def extract_salient_regions(
             # Euclidean distance transform
             dist_map = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
             _, max_val, _, max_loc = cv2.minMaxLoc(dist_map)
+            radius = float(max_val)
 
-            regions_info.append(
-                {
-                    "label": label,
-                    "area": area,
-                    "center": max_loc,  # (column_x, row_y) inside the area
-                    "max_inscribed_radius": float(max_val),
-                }
-            )
+            bx, by, bw, bh = (int(v) for v in stats[label, :4])
+            info = {
+                "label": label,
+                "area": area,
+                "center": max_loc,  # (column_x, row_y) inside the area
+                "max_inscribed_radius": radius,
+                "bbox": (bx, by, bx + bw, by + bh),
+                "solidity": area / (np.pi * radius**2) if radius > 0 else 0.0,
+            }
+            if score_map is not None:
+                values = score_map[comp_mask > 0]
+                info["score_mean"] = float(values.mean())
+                info["score_p95"] = float(np.percentile(values, 95))
+            regions_info.append(info)
 
     return filtered_mask, regions_info
 
@@ -735,12 +784,13 @@ def _dino_pass(
     max_patches: int = DEFAULT_MAX_PATCHES,
     options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[Dict] = None,
-) -> np.ndarray:
-    """Runs DINO on one image view; returns binary anomaly mask at native image size.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Runs DINO on one image view.
 
-    When ``trace`` is given, it is filled in-place with the view ``scale`` and the
-    raw normalized anomaly heatmap (``norm_score``), which the zoom trace uses to
-    render layer-by-layer diagnostics.
+    Returns the binary anomaly mask and the normalized heatmap, both at native
+    view size. When ``trace`` is given, it is filled in-place with the view
+    ``scale`` and the raw normalized anomaly heatmap (``norm_score``), which the
+    zoom trace uses to render layer-by-layer diagnostics.
     """
     scale = _view_scale(image, long_side, resolution_scale)
     norm_score = _compute_dino_heatmap(
@@ -758,13 +808,14 @@ def _dino_pass(
     if trace is not None:
         trace["scale"] = scale
         trace["norm_score"] = norm_score
-    return segment_anomalies(
+    mask = segment_anomalies(
         norm_score,
         percentile_threshold=percentile_threshold,
         method=options.mask_method,
         low_percentile=options.low_percentile,
         closing_kernel_size=options.closing_kernel_size,
     )
+    return mask, norm_score
 
 
 def run_dino_view(
@@ -907,23 +958,131 @@ def _interest_zones(
     ]
 
 
+def _circles_overlap(a: RawPoint, b: RawPoint) -> bool:
+    """True when the two inscribed circles overlap."""
+    return (a.x - b.x) ** 2 + (a.y - b.y) ** 2 < (a.radius + b.radius) ** 2
+
+
+def _detection_matches(a: RawPoint, b: RawPoint) -> bool:
+    """True when two raw points from different levels likely belong to one object.
+
+    Circle overlap alone misses wide or hollow coarse regions whose inscribed
+    center sits far from a deep detection near the region edge, so containment
+    of one center inside the other's region box also counts.
+    """
+    if _circles_overlap(a, b):
+        return True
+    for point, box in ((a, b.bbox), (b, a.bbox)):
+        if box is None:
+            continue
+        if box[0] <= point.x <= box[2] and box[1] <= point.y <= box[3]:
+            return True
+    return False
+
+
+def _cluster_level(points: list[RawPoint]) -> list[list[RawPoint]]:
+    """Transitive clustering of same-level points (conservative circle test).
+
+    Two points join when one center falls inside the other's inscribed circle
+    (``dist < max(r_i, r_j)``): strict enough to keep two close animals apart,
+    loose enough to dedupe the same region seen by overlapping views.  Uses
+    union-find, so the result does not depend on the input order.
+    """
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            a, b = points[i], points[j]
+            if (a.x - b.x) ** 2 + (a.y - b.y) ** 2 < max(a.radius, b.radius) ** 2:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+    groups: dict[int, list[RawPoint]] = {}
+    for i, point in enumerate(points):
+        groups.setdefault(find(i), []).append(point)
+    return list(groups.values())
+
+
 def _merge_points(
-    points: list[tuple[int, int, float, int]],
-) -> list[tuple[int, int, float, int]]:
-    """Greedy merge of points whose inscribed circles overlap; keeps the deepest level."""
-    kept: list[list] = []
-    for x, y, r, lvl in sorted(points, key=lambda p: -p[3]):
-        for k in kept:
-            if (x - k[0]) ** 2 + (y - k[1]) ** 2 < (r + k[2]) ** 2:
-                # ponytail: O(n^2) greedy, fine for <100 pts/frame; DBSCAN if dense scenes appear
-                k[0] = (k[0] + x) // 2
-                k[1] = (k[1] + y) // 2
-                k[2] = max(k[2], r)
-                k[3] = max(k[3], lvl)
-                break
-        else:
-            kept.append([x, y, r, lvl])
-    return [tuple(k) for k in kept]
+    points: list[RawPoint],
+    keep_absorbed: bool = False,
+) -> list[dict]:
+    """Deepest-wins merge of raw region points across zoom levels.
+
+    Same-level points are clustered transitively first. Clusters are then
+    resolved from the deepest level to the coarsest: a representative that
+    matches an already kept (deeper) cluster — inscribed circles overlap or one
+    center falls inside the other's region box — is *absorbed* into it: it only
+    adds confirmation (``n_levels``/``n_points``) and is not emitted — so the
+    emitted center and radius always belong to a real region of the deepest
+    level and never to an average across levels. A shallow representative that
+    matches no deeper cluster is kept as its own detection. With
+    ``keep_absorbed=True`` the absorbed representative is emitted as well, for
+    A/B comparisons.
+
+    Deterministic: clustering is order-independent and each cluster's
+    representative is its largest inscribed circle (ties: largest area, then
+    topmost-leftmost coordinates).
+
+    Returns one dict per detection with pixel coords (``x``, ``y``, ``radius``,
+    ``bbox``) plus ``level``, ``area``, ``solidity``, ``score_mean``,
+    ``score_p95``, ``n_levels``, ``levels`` and ``n_points``.
+    """
+    if not points:
+        return []
+
+    def representative(members: list[RawPoint]) -> RawPoint:
+        return max(members, key=lambda p: (p.radius, p.area, -p.y, -p.x))
+
+    def cluster_record(rep: RawPoint, members: list[RawPoint]) -> dict:
+        return {"rep": rep, "levels": {rep.level}, "n_points": len(members)}
+
+    by_level: dict[int, list[RawPoint]] = {}
+    for point in points:
+        by_level.setdefault(point.level, []).append(point)
+
+    kept: list[dict] = []
+    for level in sorted(by_level, reverse=True):
+        for members in _cluster_level(by_level[level]):
+            rep = representative(members)
+            hits = [k for k in kept if _detection_matches(rep, k["rep"])]
+            if hits:
+                for k in hits:
+                    k["levels"].add(level)
+                    k["n_points"] += len(members)
+                if keep_absorbed:
+                    kept.append(cluster_record(rep, members))
+            else:
+                kept.append(cluster_record(rep, members))
+
+    detections = []
+    for k in kept:
+        rep: RawPoint = k["rep"]
+        detections.append(
+            {
+                "x": rep.x,
+                "y": rep.y,
+                "radius": rep.radius,
+                "level": rep.level,
+                "area": rep.area,
+                "solidity": rep.solidity,
+                "score_mean": rep.score_mean,
+                "score_p95": rep.score_p95,
+                "bbox": rep.bbox,
+                "n_levels": len(k["levels"]),
+                "levels": tuple(sorted(k["levels"])),
+                "n_points": k["n_points"],
+            }
+        )
+    detections.sort(key=lambda d: (-d["level"], d["y"], d["x"]))
+    return detections
 
 
 def run_zoom_detector(
@@ -940,6 +1099,8 @@ def run_zoom_detector(
     max_patches: int = DEFAULT_MAX_PATCHES,
     merge_gap: float = 0.0,
     min_zone_fraction: float = 0.0,
+    min_confirmations: int = 1,
+    keep_absorbed: bool = False,
     options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[List[Dict]] = None,
 ) -> List[Dict]:
@@ -948,13 +1109,20 @@ def run_zoom_detector(
     DINO runs on a <=long_side view, multiplied by resolution_scale, then crops
     interest zones from the ORIGINAL pixels and re-detects until the view is
     native and <=long_side. Oversized scaled views are processed in overlapping
-    tiles. Points are merged across levels and returned normalized.
+    tiles. Points are merged across levels with the deepest-wins rule and
+    returned normalized to the ORIGINAL frame (letterbox bars included), so the
+    coordinates can feed SAM3 point prompts directly.
 
     ``merge_gap`` and ``min_zone_fraction`` (both fractions of the view's long
     side) control the context of each zoom crop: boxes closer than ``merge_gap``
     are fused into one zone so a single DINO pass sees several nearby objects,
     and every zone is grown to at least ``min_zone_fraction`` of the long side.
     The defaults (0) keep the original per-component crops.
+
+    ``min_confirmations`` keeps only detections that match regions from at least
+    that many recursion depths (1 = keep everything).
+    ``keep_absorbed`` emits coarse representatives that were absorbed by deeper
+    detections as well, for A/B comparisons of the merge rule.
 
     ``options`` bundles the score mode (mean/knn + local contrast) and the mask
     method (adaptive/hysteresis); see ``AnomalyOptions``.
@@ -970,19 +1138,26 @@ def run_zoom_detector(
         - 'mask': binary anomaly mask at view resolution.
         - 'regions': extract_salient_regions() output (view coords).
         - 'zones': interest-zone boxes this view recursed into (empty when stopped).
-        - 'points': raw (x, y, radius, depth) points emitted by this view, pre-merge.
+        - 'points': raw RawPoint records emitted by this view, pre-merge.
 
     Returns list of dicts with keys:
-        - 'x', 'y': normalized [0,1] center in original-image coords.
-        - 'radius': max inscribed radius, normalized by max(W, H).
-        - 'level': recursion depth the point was last confirmed at (deeper = finer).
+        - 'x', 'y': normalized [0,1] center in original-frame coords.
+        - 'radius': max inscribed radius of the deepest confirming region,
+          normalized by max(W, H) of the original frame.
+        - 'level': recursion depth of the deepest region (deeper = finer).
+        - 'bbox': normalized tight box of that region (box-prompt candidate).
+        - 'area', 'solidity', 'score_mean', 'score_p95': region metadata.
+        - 'n_levels', 'levels', 'n_points': merge confirmation counts.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if min_confirmations < 1:
+        raise ValueError("min_confirmations must be at least 1")
 
-    image = remove_letterbox(image)
+    x0, y0, x1, y1 = letterbox_box(image)
     W, H = image.size
-    points: list[tuple[int, int, float, int]] = []
+    view = image.crop((x0, y0, x1, y1))
+    points: list[RawPoint] = []
 
     def recurse(img: Image.Image, ox: int, oy: int, depth: int) -> None:
         w, h = img.size
@@ -992,7 +1167,7 @@ def run_zoom_detector(
             entry = {"depth": depth, "origin": (ox, oy), "size": (w, h)}
             trace.append(entry)
         pass_kwargs = {} if entry is None else {"trace": entry}
-        mask = _dino_pass(
+        mask, norm_score = _dino_pass(
             img, model, processor, long_side, device,
             percentile_threshold=percentile_threshold,
             resolution_scale=resolution_scale,
@@ -1001,14 +1176,24 @@ def run_zoom_detector(
             **pass_kwargs,
         )
         _, regions = extract_salient_regions(
-            mask, min_absolute_pixels=min_object_pixels
+            mask, min_absolute_pixels=min_object_pixels, score_map=norm_score
         )
         level_points = [
-            (
-                ox + reg["center"][0],
-                oy + reg["center"][1],
-                reg["max_inscribed_radius"],
-                depth,
+            RawPoint(
+                x=ox + reg["center"][0],
+                y=oy + reg["center"][1],
+                radius=reg["max_inscribed_radius"],
+                level=depth,
+                area=reg["area"],
+                solidity=reg["solidity"],
+                score_mean=reg.get("score_mean", 0.0),
+                score_p95=reg.get("score_p95", 0.0),
+                bbox=(
+                    ox + reg["bbox"][0],
+                    oy + reg["bbox"][1],
+                    ox + reg["bbox"][2],
+                    oy + reg["bbox"][3],
+                ),
             )
             for reg in regions
         ]
@@ -1033,12 +1218,35 @@ def run_zoom_detector(
         for zx0, zy0, zx1, zy1 in zones:
             recurse(img.crop((zx0, zy0, zx1, zy1)), ox + zx0, oy + zy0, depth + 1)
 
-    recurse(image, 0, 0, 0)
+    recurse(view, 0, 0, 0)
 
-    return [
-        {"x": x / W, "y": y / H, "radius": r / max(W, H), "level": lvl}
-        for x, y, r, lvl in _merge_points(points)
-    ]
+    detections = []
+    for det in _merge_points(points, keep_absorbed=keep_absorbed):
+        if det["n_levels"] < min_confirmations:
+            continue
+        bx0, by0, bx1, by1 = det["bbox"]
+        detections.append(
+            {
+                "x": (det["x"] + x0) / W,
+                "y": (det["y"] + y0) / H,
+                "radius": det["radius"] / max(W, H),
+                "level": det["level"],
+                "bbox": (
+                    (bx0 + x0) / W,
+                    (by0 + y0) / H,
+                    (bx1 + x0) / W,
+                    (by1 + y0) / H,
+                ),
+                "area": det["area"],
+                "solidity": det["solidity"],
+                "score_mean": det["score_mean"],
+                "score_p95": det["score_p95"],
+                "n_levels": det["n_levels"],
+                "levels": det["levels"],
+                "n_points": det["n_points"],
+            }
+        )
+    return detections
 
 
 def plot_detection_results(
@@ -1202,15 +1410,17 @@ def plot_zoom_overview(
 
     Boxes are colored by recursion depth; final merged ``detections`` (as
     returned by ``run_zoom_detector``) are drawn on top, colored by their
-    confirmation level.
+    confirmation level, with their normalized boxes.
 
     Args:
-        image: the letterbox-cropped base frame passed to ``run_zoom_detector``.
+        image: the original frame passed to ``run_zoom_detector`` (letterbox
+            bars are cropped internally).
         trace: the list filled by ``run_zoom_detector(..., trace=trace)``.
         detections: optional merged detections from the same call.
     """
-    img_np = np.asarray(image.convert("RGB"))
+    x0, y0, x1, y1 = letterbox_box(image)
     W, H = image.size
+    img_np = np.asarray(image.crop((x0, y0, x1, y1)).convert("RGB"))
     fig, ax = plt.subplots(1, 1, figsize=figsize)
     ax.imshow(img_np)
 
@@ -1223,7 +1433,7 @@ def plot_zoom_overview(
         w, h = entry["size"]
         ax.add_patch(
             plt.Rectangle(
-                (ox, oy),
+                (ox + x0, oy + y0),
                 w,
                 h,
                 facecolor=color,
@@ -1234,7 +1444,7 @@ def plot_zoom_overview(
         )
         ax.annotate(
             f"L{depth}",
-            (ox + 4, oy + 14),
+            (ox + x0 + 4, oy + y0 + 14),
             color="white",
             fontsize=8,
             weight="bold",
@@ -1256,6 +1466,21 @@ def plot_zoom_overview(
                     linestyle="--",
                     linewidth=1.2,
                     alpha=0.9,
+                )
+            )
+        bbox = det.get("bbox")
+        if bbox is not None:
+            bx0, by0, bx1, by1 = bbox
+            ax.add_patch(
+                plt.Rectangle(
+                    (bx0 * W, by0 * H),
+                    (bx1 - bx0) * W,
+                    (by1 - by0) * H,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.0,
+                    alpha=0.7,
+                    zorder=6,
                 )
             )
 
@@ -1286,13 +1511,14 @@ def plot_zoom_level(
     mask with region centers/inscribed radii and child zoom zones, and the raw
     points emitted by this view (pre-merge).
 
-    ``image`` must be the letterbox-cropped base frame passed to
-    ``run_zoom_detector``; the view is reconstructed from ``entry['origin']``
-    and ``entry['size']``.
+    ``image`` must be the original frame passed to ``run_zoom_detector``
+    (letterbox bars are cropped internally); the view is reconstructed from
+    ``entry['origin']`` and ``entry['size']``, both in cropped-frame coords.
     """
+    x0, y0, _, _ = letterbox_box(image)
     ox, oy = entry["origin"]
     w, h = entry["size"]
-    view = image.crop((ox, oy, ox + w, oy + h))
+    view = image.crop((x0 + ox, y0 + oy, x0 + ox + w, y0 + oy + h))
     view_np = np.asarray(view.convert("RGB"))
     mask = entry["mask"]
     regions = entry["regions"]
@@ -1327,14 +1553,14 @@ def plot_zoom_level(
 
     axes[3].imshow(view_np)
     axes[3].set_title(f"points emitted ({len(entry['points'])})")
-    for px, py, radius, _ in entry["points"]:
-        cx, cy = px - ox, py - oy
+    for point in entry["points"]:
+        cx, cy = point.x - ox, point.y - oy
         axes[3].scatter(cx, cy, c="cyan", edgecolors="black", s=60, zorder=5)
-        if radius > 2:
+        if point.radius > 2:
             axes[3].add_patch(
                 plt.Circle(
                     (cx, cy),
-                    radius,
+                    point.radius,
                     color="cyan",
                     fill=False,
                     linestyle="--",

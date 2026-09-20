@@ -56,10 +56,14 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
    applies the final morphological opening. `"adaptive"` is the legacy
    top-percentile ∩ local adaptive core.
 6. Regions: `extract_salient_regions(binary_mask, method="otsu"|"iqr",
-   iqr_k=1.5, min_absolute_pixels=20)` — connected components (8-connectivity),
-   area thresholding (Otsu on log-areas, or IQR outlier rule), and per region:
-   `{'label', 'area', 'center': (x, y), 'max_inscribed_radius'}` where `center`
-   is the distance-transform maximum (guaranteed inside the component).
+   iqr_k=1.5, min_absolute_pixels=20, score_map=None)` — connected components
+   (8-connectivity), area thresholding (Otsu on log-areas, or IQR outlier rule),
+   and per region: `{'label', 'area', 'center': (x, y), 'max_inscribed_radius',
+   'bbox', 'solidity'}` where `center` is the distance-transform maximum
+   (guaranteed inside the component), `bbox` is the tight component box and
+   `solidity = area / (pi * r^2)` (~1 disk, ~1.27 square, larger when the
+   component is elongated or hollow). With `score_map` (the `norm_score` of the
+   view) it also adds `score_mean`/`score_p95` inside the component.
 7. End-to-end wrapper: `run_dino_detector(raw_image, model, processor,
     resolution_scale=4.0, percentile_threshold=99.5, visualize=True, device=None,
     options=AnomalyOptions())` → `(final_mask, norm_score, cropped_image)`.
@@ -74,10 +78,34 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
    diagnostics.
    Passing `trace=[]` collects one record per view, in depth-first order, with
    `depth`, `origin`, `size`, `scale`, `feed_native`, `norm_score`, `mask`,
-   `regions`, `zones` and raw `points` — used by the layer-by-layer notebook.
+   `regions`, `zones` and raw `points` (`RawPoint` records) — used by the
+   layer-by-layer notebook.
    `merge_gap` and `min_zone_fraction` (defaults 0 = legacy per-component crops)
    shape the zoom context: boxes closer than the gap fuse into one zone and every
    zone grows to at least that fraction of the view's long side.
+   `min_confirmations=k` keeps only detections confirmed at k different recursion
+   depths (default 1 = keep everything) and `keep_absorbed=True` re-emits
+   absorbed coarse representatives for A/B comparisons.
+
+## Merge semantics (deepest-wins)
+
+Raw points from every view are merged by `_merge_points(points,
+keep_absorbed=False)`. Same-level points are clustered transitively (one center
+inside the other's inscribed circle, conservative), and levels are then resolved
+from deep to coarse: a representative matching an already kept deeper cluster
+(circles overlap OR one center falls inside the other's region box) is
+*absorbed* — it only adds confirmation to `n_levels`/`n_points` — so emitted
+centers and radii always belong to a real region of the deepest level and never
+to an average across levels. A shallow representative matching no deeper
+cluster is kept as its own detection (an object only seen at coarse
+resolution). `level` is the deepest confirming region; `n_levels`/`levels`
+count the recursion depths that confirmed the object.
+
+`run_zoom_detector` normalizes the output to the ORIGINAL frame (letterbox bars
+included, offset from `letterbox_box`) so detections are directly usable as SAM3
+point prompts (`rel_coordinates=True`). Each detection dict carries `x`, `y`,
+`radius`, `level`, `bbox` (normalized), `area`, `solidity`, `score_mean`,
+`score_p95`, `n_levels`, `levels` and `n_points`.
 
 ## Visualization helpers
 
@@ -86,10 +114,12 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
   empty detections.
 - `plot_regions_with_centers(image, filtered_mask, regions_info, show_mask=True,
   show_radius=True, ...)` — interior points, optional inscribed circles.
-- `plot_zoom_overview(image, trace, detections=None)` — full frame with one
-  depth-colored box per traced zoom view, plus merged detections.
+- `plot_zoom_overview(image, trace, detections=None)` — original frame (bars
+  cropped internally) with one depth-colored box per traced zoom view, plus
+  merged detections and their boxes.
 - `plot_zoom_level(image, entry)` — one traced view as four image panels: input
-  crop, anomaly heatmap, mask + regions + zones, and emitted points.
+  crop, anomaly heatmap, mask + regions + zones, and emitted `RawPoint`s. Takes
+  the original frame; the view is reconstructed from `entry['origin']`/`size`.
 
 ## Gotchas
 
@@ -118,6 +148,24 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
 - `center` in `regions_info` is `(x, y)` (column, row) — the OpenCV convention,
   not numpy `(row, col)`; keep this straight when converting to relative point
   prompts for SAM3.
+- Merge is deepest-wins: a coarse halo blob overlapping deep detections is
+  absorbed (kept only in `n_levels`), so the emitted center/radius always come
+  from a real deep region. On the 4K footage the old greedy merge averaged the
+  center (74 px off the deep region) and kept the coarse `radius` (139.8 px vs
+  the real 42.3 px).
+- Cross-level confirmation uses circle overlap OR bbox containment: a wide
+  coarse region whose inscribed center sits far from a deep detection still
+  confirms it (verified on the 4K footage — circle overlap alone missed the
+  largest deep blob). Same-level clustering stays conservative (circle only) so
+  two close animals are not fused by one wide box.
+- Detections come normalized to the ORIGINAL frame (`letterbox_box` offset
+  included), so `det['x'] * frame.size[0]` plots on the raw frame and feeds SAM3
+  relative prompts directly; to draw on a manually cropped frame, subtract the
+  crop origin from `letterbox_box`.
+- `n_levels` counts recursion depths (not views) with a matching region. A
+  detection with `n_levels=1` was only seen at one level: `min_confirmations=2`
+  drops those, which is a cheap false-positive filter but can drop real objects
+  that the coarse view missed.
 - Otsu area filtering (`method="otsu"`) needs >2 candidate components; with fewer
   it falls back to the median area. `"iqr"` suits scenes where the mask is nearly
   all noise with a few isolated blobs.

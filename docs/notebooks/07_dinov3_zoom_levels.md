@@ -16,11 +16,14 @@ only returning merged points.
 4. `levels = []`; `run_zoom_detector(..., trace=levels)` with
    `merge_gap=0.08, min_zone_fraction=0.25` (context crops: fuse nearby boxes,
    never zoom into a crop smaller than 25% of the view's long side); print views
-   per depth and the merged-detection count.
-5. `plot_zoom_overview(cropped_frame, levels, detections)` — full frame with one
-   depth-colored box per traced view, plus the merged detections.
-6. Loop over `levels` → `plot_zoom_level(cropped_frame, entry)`: four image panels
-   per layer (input crop; anomaly heatmap; mask + regions + zones; emitted points).
+   per depth and the merged-detection count. Detections are deepest-wins: they
+   carry `level`, `n_levels`/`levels` (confirming depths), `bbox` and region
+   metadata (`area`, `solidity`, `score_mean`).
+5. `plot_zoom_overview(frame, levels, detections)` — original frame with one
+   depth-colored box per traced view, plus the merged detections and their boxes.
+6. Loop over `levels` → `plot_zoom_level(frame, entry)`: four image panels
+   per layer (input crop; anomaly heatmap; mask + regions + zones; emitted
+   `RawPoint`s).
 7. Plot the final merged detections colored by confirmation level.
 
 ## Inputs / outputs
