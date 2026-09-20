@@ -30,6 +30,8 @@ Support files:
   trace-driven layer-by-layer view of the DINO zoom detector.
 - [notebooks/08_dinov3_heatmap_ab.md](notebooks/08_dinov3_heatmap_ab.md) —
   score-mode/local-contrast and mask-method A/B for the DINO detector.
+- [notebooks/09_dino_sam_tracking.md](notebooks/09_dino_sam_tracking.md) — DINO
+  candidate points as SAM3 point prompts + masklet tracking.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 

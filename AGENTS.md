@@ -4,7 +4,8 @@ Research project: segment and track dolphins in aerial drone footage using Meta
 SAM3 (text-prompted video segmentation/tracking) and DINOv3 (anomaly-based object
 detection). All functions/classes live in the `fish_segmentation` package
 (`src/fish_segmentation/`); notebooks in `notebooks/` are thin drivers (no
-function definitions). No tests, no lint config, no CI.
+function definitions). Tests live in `tests/` (pytest-style; `test_zoom_detector.py`
+also runs standalone). No lint config, no CI.
 
 Per-file explanations live in `docs/` — start at `docs/index.md`.
 
@@ -45,20 +46,26 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
     cwd dependence) + `load_env()` (`load_dotenv(<root>/.env)`).
   - `video_io.py` — `load_all_frames_rgb()` (all frames, numpy/PIL-paths for SAM3
     visualization) and `load_sampled_frames()` (n equally spaced PIL frames).
-  - `sam3_utils.py` — `propagate_in_video()`, `add_text_prompt()`.
+  - `sam3_utils.py` — `propagate_in_video()`, `add_text_prompt()`,
+    `add_point_prompt()`.
   - `ingest.py` — DJI dataset ingestion (transcode to 1024x576 @ 15 fps + exiftool/
     ffprobe metadata sidecar).
   - `enhance.py` — marine video enhancement (deglint/inpaint, edge-preserving
     smoothing, CLAHE).
   - `dinov3.py` — DINOv3 anomaly detection pipeline (heatmap → mask → salient
-    regions with guaranteed-interior points).
+    regions with guaranteed-interior points, coarse-to-fine zoom with
+    deepest-wins merge).
   - `download_dataset.py` — `main()` behind the `fish-segmentation` console
     script: fetch raw dataset from a hardcoded Google Drive folder into `dataset/`.
 - `notebooks/` — driver notebooks (process only): `01_ingest`, `02_enhance`,
   `03_dinov3_detect`, `04_sam3_track` (main SAM3 pipeline), `05_smoke_test`
-  (SAM3 constructor-argument reference). Outputs go to `notebooks/outputs/`
-  (gitignored). `notebooks/reference/sam3_video_predictor.ipynb` is the upstream
-  Meta demo, reference only — do not execute or develop in it.
+  (SAM3 constructor-argument reference), `07_dinov3_zoom_levels` (zoom trace),
+  `08_dinov3_heatmap_ab` (score/mask A/B), `09_dino_sam_tracking` (DINO points
+  as SAM3 tracker prompts). Outputs go to `notebooks/outputs/` (gitignored).
+  `notebooks/reference/sam3_video_predictor.ipynb` is the upstream Meta demo,
+  reference only — do not execute or develop in it.
+- `tests/` — CPU-only pytest-suite (heatmap, zoom geometry/merge, SAM3 request
+  wrappers); `tests/test_zoom_detector.py` also runs as a standalone script.
 - `data/test_media/` — git-tracked sample media (dolphin_00..03.mp4, dogs.jpg,
   dogs_playing.mp4). Default input for the driver notebooks.
 - `dataset/` — gitignored, local only. `unprocessed/` = raw DJI footage;
@@ -72,6 +79,13 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
   `propagate_in_video` → `close_session` → `predictor.shutdown()`. You MUST
   `reset_session` before switching to a different text prompt in the same session,
   or results are wrong.
+- SAM3 point prompts cannot be mixed with a text/box prompt in one `add_prompt`
+  call (`add_point_prompt()`), and a tracker-only session must pass
+  `start_frame_index` to `propagate_in_video` — SAM3 otherwise raises
+  "No prompts are received on any frames".
+- `run_zoom_detector` detections are normalized to the ORIGINAL frame (letterbox
+  bars included) with `x`/`y`, `bbox`, `level`, `n_levels` and region metadata, so
+  they feed SAM3 point prompts directly (`rel_coordinates=True`).
 - `find_repo_root()` depends on the kernel cwd being inside the repo — don't
   hardcode absolute paths in notebooks; compute from `ROOT`.
 - `dataset/` and `notebooks/outputs/` are gitignored — never commit media or
