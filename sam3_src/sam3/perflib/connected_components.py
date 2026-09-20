@@ -2,6 +2,7 @@
 
 # pyre-unsafe
 import logging
+import math
 
 import torch
 
@@ -75,13 +76,19 @@ def connected_components(input_tensor: torch.Tensor):
     if input_tensor.is_cuda:
         if HAS_CC_TORCH:
             return get_connected_components(input_tensor.to(torch.uint8))
-        else:
+        elif math.ceil(input_tensor.shape[-2] / 4) * math.ceil(
+            input_tensor.shape[-1] / 16
+        ) <= 65535:
             # triton fallback
+            # Local patch: the triton kernel tiles HxW on grid dim 1 with its
+            # autotune block sizes (4x16); masks above ~4M px (e.g. 2160x3840
+            # video resolution) exceed CUDA's 65,535 grid-dim limit and the
+            # launch fails with "Triton Error [CUDA]: invalid argument".
             from sam3.perflib.triton.connected_components import (
                 connected_components_triton,
             )
 
             return connected_components_triton(input_tensor)
 
-    # CPU fallback
+    # CPU fallback (also for CUDA masks too large for the triton kernel)
     return connected_components_cpu(input_tensor)
