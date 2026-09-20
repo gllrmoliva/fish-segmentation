@@ -3,10 +3,13 @@
 import numpy as np
 
 from fish_segmentation.sam3_utils import (
+    _bbox_to_cxcywh,
     add_point_prompt,
+    detection_erase_mask,
     next_obj_id,
     point_in_existing_mask,
     propagate_in_video,
+    segment_boxes,
     select_new_points,
 )
 
@@ -200,3 +203,107 @@ def test_next_obj_id_scans_every_frame():
         )
         == 3
     )
+
+
+class FakeImageProcessor:
+    """Minimal Sam3Processor stand-in for the image-model box wrapper."""
+
+    def __init__(self, outputs=None):
+        self.outputs = list(outputs or [])
+        self.prompts = []
+        self.resets = 0
+
+    def set_image(self, image):
+        return {}
+
+    def add_geometric_prompt(self, box, label, state):
+        self.prompts.append((list(box), label))
+        return self.outputs.pop(0)
+
+    def reset_all_prompts(self, state):
+        self.resets += 1
+
+
+def test_segment_boxes_keeps_best_mask_and_resets():
+    masks = np.zeros((2, 1, 6, 6), dtype=bool)
+    masks[1, 0, 2:4, 2:4] = True
+    processor = FakeImageProcessor(
+        [{"masks": masks, "scores": np.array([0.1, 0.9])}]
+    )
+
+    results = segment_boxes(processor, image=None, boxes=[[0.5, 0.5, 0.4, 0.4]])
+
+    assert results[0]["score"] == 0.9
+    assert results[0]["mask"].shape == (6, 6)
+    assert results[0]["mask"][2:4, 2:4].all()
+    assert processor.prompts == [([0.5, 0.5, 0.4, 0.4], True)]
+    assert processor.resets == 1
+
+
+def test_segment_boxes_empty_output_is_none():
+    processor = FakeImageProcessor(
+        [{"masks": np.zeros((0, 1, 6, 6), bool), "scores": np.zeros(0)}]
+    )
+
+    results = segment_boxes(processor, image=None, boxes=[[0.5, 0.5, 0.1, 0.1]])
+
+    assert results[0] == {"mask": None, "score": 0.0}
+    assert processor.resets == 1
+
+
+def test_bbox_to_cxcywh_clamps_and_orders():
+    assert _bbox_to_cxcywh((-0.1, 0.2, 0.5, 0.9)) == [0.25, 0.55, 0.5, 0.7]
+    assert _bbox_to_cxcywh((0.5, 0.9, 0.1, 0.2)) == [0.3, 0.55, 0.4, 0.7]
+
+
+def _image_100():
+    from PIL import Image
+
+    return Image.new("RGB", (100, 100))
+
+
+def test_detection_erase_mask_falls_back_on_large_or_weak_masks():
+    giant = np.zeros((1, 1, 100, 100), dtype=bool)
+    giant[0, 0, :70, :70] = True  # 4900 px > 25% of 10000
+    small = np.zeros((1, 1, 100, 100), dtype=bool)
+    small[0, 0, 60:70, 60:70] = True
+
+    processor = FakeImageProcessor(
+        [
+            {"masks": giant, "scores": np.array([0.9])},
+            {"masks": small, "scores": np.array([0.9])},
+        ]
+    )
+    detections = [
+        _det(0.15, 0.15, bbox=(0.1, 0.1, 0.2, 0.2)),
+        _det(0.65, 0.65, bbox=(0.6, 0.6, 0.7, 0.7)),
+    ]
+
+    union = detection_erase_mask(
+        processor, _image_100(), detections, max_area_fraction=0.25, min_score=0.5
+    )
+
+    assert union[10:20, 10:20].all(), "rejected giant mask must fall back to the bbox"
+    assert union[60:70, 60:70].all(), "accepted SAM3 mask must be kept"
+    assert not union[:5, :5].any()
+
+    # a low-confidence mask is rejected too
+    processor = FakeImageProcessor([{"masks": small, "scores": np.array([0.1])}])
+    union = detection_erase_mask(
+        processor,
+        _image_100(),
+        [_det(0.15, 0.15, bbox=(0.1, 0.1, 0.2, 0.2))],
+        min_score=0.5,
+    )
+    assert union[10:20, 10:20].all()
+
+
+def test_detection_erase_mask_without_bbox_skips_sam3():
+    processor = FakeImageProcessor([])
+
+    union = detection_erase_mask(
+        processor, _image_100(), [{"x": 0.5, "y": 0.5, "radius": 0.1, "bbox": None}]
+    )
+
+    assert union.any()
+    assert processor.prompts == []

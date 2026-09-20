@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
+
+from fish_segmentation.sam3_utils import point_in_existing_mask, select_new_points
 
 
 PATCH_SIZE = 16
@@ -169,6 +171,7 @@ def compute_anomaly_heatmap(
     knn_k: int = 5,
     local_contrast_strength: float = 0.0,
     local_contrast_sigma_pct: float = 0.05,
+    suppress_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Calculates cosine-distance anomaly scores, suppresses border tokens,
@@ -192,6 +195,12 @@ def compute_anomaly_heatmap(
             heatmap inspection; a large sigma (~0.25) only removes the
             very-low-frequency positional fog and survives the zoom recursion
             (objects bigger than the blur are not hollowed into rings).
+        suppress_mask: optional boolean patch-grid mask (shape ``grid_shape``)
+            with the patches to erase from the reference pool (already found
+            objects). Suppressed patches are excluded from the pool used to score
+            every token and their final scores are pinned to the map minimum, so
+            they cannot come back in later iterations. Local contrast is applied
+            before pinning, so the low values never bleed into their neighbours.
     """
     if score_mode not in ("mean", "knn"):
         raise ValueError("score_mode must be 'mean' or 'knn'")
@@ -204,18 +213,41 @@ def compute_anomaly_heatmap(
     num_patches = h_patches * w_patches
     orig_w, orig_h = target_shape
 
+    suppress_flat = None
+    if suppress_mask is not None:
+        suppress_flat = np.asarray(suppress_mask, dtype=bool).reshape(-1)
+        if suppress_flat.shape[0] != num_patches:
+            raise ValueError(
+                "suppress_mask must have one entry per patch (grid_shape)"
+            )
+
+    keep_idx = None
+    if suppress_flat is not None:
+        keep = np.flatnonzero(~suppress_flat)
+        # Everything suppressed: fall back to the full pool (no reference to
+        # compare against, but callers must not crash on a degenerate mask).
+        keep_idx = keep if keep.size > 0 else None
+
     # Contrast against sampled reference pool to avoid O(N^2) memory bottlenecks
     if num_patches > (max_sample_pool * 2):
         # Fixed seed: the same reference pattern is reused every call, so tiled
         # bias subtraction and repeated runs stay reproducible.
         generator = torch.Generator(device=tokens.device)
         generator.manual_seed(0)
-        sample_idx = torch.randperm(
-            num_patches, generator=generator, device=tokens.device
+        pool_size = num_patches if keep_idx is None else keep_idx.size
+        perm = torch.randperm(
+            pool_size, generator=generator, device=tokens.device
         )[:max_sample_pool]
+        if keep_idx is None:
+            sample_idx = perm
+        else:
+            sample_idx = torch.as_tensor(keep_idx, device=tokens.device)[perm]
         similarity_matrix = torch.matmul(tokens, tokens[sample_idx].T)
-    else:
+    elif keep_idx is None:
         similarity_matrix = torch.matmul(tokens, tokens.T)
+    else:
+        pool = torch.as_tensor(keep_idx, device=tokens.device)
+        similarity_matrix = torch.matmul(tokens, tokens[pool].T)
 
     if score_mode == "knn":
         k = min(knn_k, similarity_matrix.shape[1])
@@ -229,6 +261,10 @@ def compute_anomaly_heatmap(
         strength=local_contrast_strength,
         sigma_pct=local_contrast_sigma_pct,
     )
+
+    if suppress_flat is not None and keep_idx is not None:
+        grid_scores = grid_scores.copy()
+        grid_scores[suppress_flat.reshape(h_patches, w_patches)] = grid_scores.min()
 
     # ViT border artifact suppression
     border_y = max(1, int(h_patches * border_margin_pct))
@@ -311,6 +347,52 @@ def _tile_size_for_scale(scale: float, max_patches: int) -> int:
     return tile_size
 
 
+def _mask_to_patch_grid(mask: np.ndarray, grid_shape: Tuple[int, int]) -> np.ndarray:
+    """Rasterizes a native-resolution mask onto the ViT patch grid.
+
+    A patch counts as suppressed when any of its pixels is masked (INTER_AREA
+    fraction > 0), so sub-patch objects are not split by the downscale.
+    """
+    h_patches, w_patches = grid_shape
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("suppress_mask must be a 2D array")
+    if mask.shape == (h_patches, w_patches):
+        return mask.copy()
+    if mask.shape[0] < 1 or mask.shape[1] < 1:
+        raise ValueError("suppress_mask must not be empty")
+    resized = cv2.resize(
+        mask.astype(np.float32),
+        (w_patches, h_patches),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized > 0
+
+
+def replace_masked_tokens(
+    tokens: torch.Tensor, patch_mask: np.ndarray
+) -> torch.Tensor:
+    """Replaces masked patch tokens with the mean of the unmasked ones.
+
+    Zeroing the tokens would be wrong: ``extract_patch_tokens`` L2-normalizes,
+    so a zero vector has cosine similarity 0 with everything and scores as the
+    MAXIMUM anomaly. The mean of the surviving tokens is re-normalized instead,
+    i.e. a water prototype that looks like the rest of the frame.
+    """
+    mask = np.asarray(patch_mask, dtype=bool).reshape(-1)
+    if mask.shape[0] != tokens.shape[0]:
+        raise ValueError("patch_mask must have one entry per token")
+    if not mask.any() or mask.all():
+        return tokens
+
+    keep = ~mask
+    mean = tokens[keep].to(torch.float32).mean(dim=0)
+    mean = F.normalize(mean, dim=-1)
+    out = tokens.to(torch.float32).clone()
+    out[mask] = mean
+    return F.normalize(out, p=2, dim=-1)
+
+
 def _run_dino_heatmap(
     image: Image.Image,
     model: AutoModel,
@@ -322,11 +404,35 @@ def _run_dino_heatmap(
     knn_k: int = 5,
     local_contrast_strength: float = 0.0,
     local_contrast_sigma_pct: float = 0.05,
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> np.ndarray:
+    """Runs one ViT forward pass and turns its tokens into a heatmap.
+
+    ``suppress_mask`` is a native-image-resolution boolean mask of already found
+    objects. ``suppress_mode="score"`` only removes them from the reference pool
+    and pins their scores; ``"tokens"`` additionally replaces their patch tokens
+    with the mean of the surviving ones before scoring (single forward pass).
+    """
+    if suppress_mode not in ("score", "tokens"):
+        raise ValueError("suppress_mode must be 'score' or 'tokens'")
+
+    if suppress_mask is not None:
+        suppress_mask = np.asarray(suppress_mask, dtype=bool)
+        if suppress_mask.shape != (image.height, image.width):
+            raise ValueError("suppress_mask must match the image size")
+
     pixel_values, (h_patches, w_patches), orig_shape = prepare_scaled_tensor(
         image, processor, scale=scale, device=device
     )
+    patch_suppress = None
+    if suppress_mask is not None:
+        patch_suppress = _mask_to_patch_grid(
+            suppress_mask, (h_patches, w_patches)
+        )
     tokens = extract_patch_tokens(model, pixel_values, num_patches=h_patches * w_patches)
+    if patch_suppress is not None and suppress_mode == "tokens":
+        tokens = replace_masked_tokens(tokens, patch_suppress)
     return compute_anomaly_heatmap(
         tokens,
         grid_shape=(h_patches, w_patches),
@@ -336,6 +442,7 @@ def _run_dino_heatmap(
         knn_k=knn_k,
         local_contrast_strength=local_contrast_strength,
         local_contrast_sigma_pct=local_contrast_sigma_pct,
+        suppress_mask=patch_suppress,
     )
 
 
@@ -382,6 +489,8 @@ def _tiled_dino_heatmap(
     knn_k: int = 5,
     local_contrast_strength: float = 0.0,
     local_contrast_sigma_pct: float = 0.05,
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> np.ndarray:
     """Computes a high-resolution heatmap from overlapping tiles.
 
@@ -398,6 +507,10 @@ def _tiled_dino_heatmap(
     Local contrast is applied to the stitched map, never per tile: high-passing
     each tile amplifies its own water texture and destroys cross-tile
     comparability, which surface as scattered specks after stitching.
+
+    ``suppress_mask`` (native view resolution) is cropped into every tile so the
+    suppressed patches leave that tile's reference pool too, and the stitched
+    map is pinned to its minimum inside the mask after the local-contrast pass.
     """
     width, height = image.size
     tile_size = _tile_size_for_scale(scale, max_patches)
@@ -406,11 +519,23 @@ def _tiled_dino_heatmap(
     x_starts = _tile_starts(width, tile_size, tile_overlap)
     y_starts = _tile_starts(height, tile_size, tile_overlap)
 
+    suppress = None
+    if suppress_mask is not None:
+        suppress = np.asarray(suppress_mask, dtype=bool)
+        if suppress.shape != (height, width):
+            raise ValueError("suppress_mask must match the image size")
+
     tiles: list[tuple[int, int, np.ndarray]] = []
     for y0 in y_starts:
         for x0 in x_starts:
             x1, y1 = min(width, x0 + tile_size), min(height, y0 + tile_size)
             tile = image.crop((x0, y0, x1, y1))
+            tile_suppress = None if suppress is None else suppress[y0:y1, x0:x1]
+            tile_kwargs = (
+                {}
+                if tile_suppress is None
+                else {"suppress_mask": tile_suppress, "suppress_mode": suppress_mode}
+            )
             try:
                 tile_score = _run_dino_heatmap(
                     tile,
@@ -421,6 +546,7 @@ def _tiled_dino_heatmap(
                     normalize=False,
                     score_mode=score_mode,
                     knn_k=knn_k,
+                    **tile_kwargs,
                 )
             except torch.cuda.OutOfMemoryError:
                 if torch.device(device).type != "cuda" or max_patches <= 1:
@@ -438,6 +564,8 @@ def _tiled_dino_heatmap(
                     knn_k=knn_k,
                     local_contrast_strength=local_contrast_strength,
                     local_contrast_sigma_pct=local_contrast_sigma_pct,
+                    suppress_mask=suppress_mask,
+                    suppress_mode=suppress_mode,
                 )
             tiles.append((x0, y0, tile_score))
 
@@ -466,6 +594,8 @@ def _tiled_dino_heatmap(
         strength=local_contrast_strength,
         sigma_pct=local_contrast_sigma_pct,
     )
+    if suppress is not None:
+        stitched[suppress] = stitched.min()
     span = float(stitched.max() - stitched.min())
     if span < 1e-6:
         return np.zeros_like(stitched)
@@ -484,6 +614,8 @@ def _compute_dino_heatmap(
     knn_k: int = 5,
     local_contrast_strength: float = 0.0,
     local_contrast_sigma_pct: float = 0.05,
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> np.ndarray:
     """Runs one DINO view directly or in tiles when its patch grid is too large."""
     if max_patches <= 0:
@@ -495,6 +627,9 @@ def _compute_dino_heatmap(
         "local_contrast_strength": local_contrast_strength,
         "local_contrast_sigma_pct": local_contrast_sigma_pct,
     }
+    if suppress_mask is not None:
+        heatmap_kwargs["suppress_mask"] = suppress_mask
+        heatmap_kwargs["suppress_mode"] = suppress_mode
     patch_count = _patch_count(image.size, scale)
     if patch_count > max_patches:
         return _tiled_dino_heatmap(
@@ -555,6 +690,7 @@ def segment_anomalies(
     method: Literal["adaptive", "hysteresis"] = "hysteresis",
     low_percentile: float = 98.0,
     closing_kernel_size: int = 0,
+    valid_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Builds the anomaly mask with global percentile filtering and morphology.
 
@@ -570,21 +706,40 @@ def segment_anomalies(
             (0 < low_percentile <= percentile_threshold).
         closing_kernel_size: optional morphological closing (ellipse, px) before
             the final opening; bridges small gaps between fragments. 0 disables.
+        valid_mask: optional boolean mask of the pixels allowed to set the
+            percentiles (e.g. everything except already suppressed regions). The
+            mask is still built over the full map, but the thresholds ignore the
+            excluded pixels, which keeps the next iteration's percentiles on the
+            same scale as the first one.
     """
     if method not in ("adaptive", "hysteresis"):
         raise ValueError("method must be 'adaptive' or 'hysteresis'")
     if closing_kernel_size < 0:
         raise ValueError("closing_kernel_size must be non-negative")
 
+    if valid_mask is None:
+        reference = norm_score
+        working = norm_score
+    else:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != norm_score.shape:
+            raise ValueError("valid_mask must match the score map shape")
+        reference = norm_score[valid]
+        if reference.size == 0:
+            raise ValueError("valid_mask must contain at least one True pixel")
+        # Excluded pixels can never join the mask, even when a threshold
+        # collapses (e.g. a flat score map with most pixels at the minimum).
+        working = np.where(valid, norm_score, -np.inf)
+
     if method == "hysteresis":
         if not 0 < low_percentile <= percentile_threshold <= 100:
             raise ValueError(
                 "percentiles must satisfy 0 < low_percentile <= percentile_threshold <= 100"
             )
-        high_val = np.percentile(norm_score, percentile_threshold)
-        low_val = np.percentile(norm_score, low_percentile)
-        seeds = (norm_score >= high_val).astype(np.uint8)
-        low_mask = (norm_score >= low_val).astype(np.uint8)
+        high_val = np.percentile(reference, percentile_threshold)
+        low_val = np.percentile(reference, low_percentile)
+        seeds = (working >= high_val).astype(np.uint8)
+        low_mask = (working >= low_val).astype(np.uint8)
         fine_mask = _grow_seeds(seeds, low_mask) * 255
 
         if closing_kernel_size > 1:
@@ -594,8 +749,8 @@ def segment_anomalies(
             fine_mask = cv2.morphologyEx(fine_mask, cv2.MORPH_CLOSE, close_kernel)
     else:
         # Top-tail percentile mask
-        threshold_val = np.percentile(norm_score, percentile_threshold)
-        binary_mask = (norm_score >= threshold_val).astype(np.uint8) * 255
+        threshold_val = np.percentile(reference, percentile_threshold)
+        binary_mask = (working >= threshold_val).astype(np.uint8) * 255
 
         # Local adaptive contrast refinement
         roi = (norm_score * 255).astype(np.uint8)
@@ -784,6 +939,8 @@ def _dino_pass(
     max_patches: int = DEFAULT_MAX_PATCHES,
     options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[Dict] = None,
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Runs DINO on one image view.
 
@@ -791,8 +948,18 @@ def _dino_pass(
     view size. When ``trace`` is given, it is filled in-place with the view
     ``scale`` and the raw normalized anomaly heatmap (``norm_score``), which the
     zoom trace uses to render layer-by-layer diagnostics.
+
+    ``suppress_mask`` (native view size) marks already found objects: they are
+    erased from the score map/reference pool (see ``suppress_mode``) and their
+    pixels are excluded from the mask percentiles, so an iteration cannot simply
+    re-report what a previous one found.
     """
     scale = _view_scale(image, long_side, resolution_scale)
+    suppress_kwargs = (
+        {}
+        if suppress_mask is None
+        else {"suppress_mask": suppress_mask, "suppress_mode": suppress_mode}
+    )
     norm_score = _compute_dino_heatmap(
         image,
         model,
@@ -804,16 +971,21 @@ def _dino_pass(
         knn_k=options.knn_k,
         local_contrast_strength=options.local_contrast_strength,
         local_contrast_sigma_pct=options.local_contrast_sigma_pct,
+        **suppress_kwargs,
     )
     if trace is not None:
         trace["scale"] = scale
         trace["norm_score"] = norm_score
+    valid_mask = None
+    if suppress_mask is not None:
+        valid_mask = ~np.asarray(suppress_mask, dtype=bool)
     mask = segment_anomalies(
         norm_score,
         percentile_threshold=percentile_threshold,
         method=options.mask_method,
         low_percentile=options.low_percentile,
         closing_kernel_size=options.closing_kernel_size,
+        valid_mask=valid_mask,
     )
     return mask, norm_score
 
@@ -828,13 +1000,26 @@ def run_dino_view(
     device: Optional[str] = None,
     max_patches: int = DEFAULT_MAX_PATCHES,
     options: AnomalyOptions = AnomalyOptions(),
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
-    """Runs one zoom-compatible DINO view and returns its mask and heatmap."""
+    """Runs one zoom-compatible DINO view and returns its mask and heatmap.
+
+    ``suppress_mask`` is a boolean mask in ORIGINAL frame coordinates (letterbox
+    bars included), same size as ``image``; it is cropped to the view and passed
+    to ``_dino_pass``.
+    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     cropped_img = remove_letterbox(image)
+    view_suppress = _crop_letterbox_mask(image, suppress_mask)
     scale = _view_scale(cropped_img, long_side, resolution_scale)
+    suppress_kwargs = (
+        {}
+        if view_suppress is None
+        else {"suppress_mask": view_suppress, "suppress_mode": suppress_mode}
+    )
     norm_score = _compute_dino_heatmap(
         cropped_img,
         model,
@@ -846,6 +1031,7 @@ def run_dino_view(
         knn_k=options.knn_k,
         local_contrast_strength=options.local_contrast_strength,
         local_contrast_sigma_pct=options.local_contrast_sigma_pct,
+        **suppress_kwargs,
     )
     final_mask = segment_anomalies(
         norm_score,
@@ -853,8 +1039,22 @@ def run_dino_view(
         method=options.mask_method,
         low_percentile=options.low_percentile,
         closing_kernel_size=options.closing_kernel_size,
+        valid_mask=None if view_suppress is None else ~view_suppress,
     )
     return final_mask, norm_score, cropped_img
+
+
+def _crop_letterbox_mask(
+    image: Image.Image, mask: Optional[np.ndarray]
+) -> Optional[np.ndarray]:
+    """Crops a full-frame boolean mask to the letterbox content box of ``image``."""
+    if mask is None:
+        return None
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != (image.height, image.width):
+        raise ValueError("mask must match the image size")
+    x0, y0, x1, y1 = letterbox_box(image)
+    return mask[y0:y1, x0:x1]
 
 
 def _boxes_within(a: list, b: list, gap: float) -> bool:
@@ -1103,6 +1303,8 @@ def run_zoom_detector(
     keep_absorbed: bool = False,
     options: AnomalyOptions = AnomalyOptions(),
     trace: Optional[List[Dict]] = None,
+    suppress_mask: Optional[np.ndarray] = None,
+    suppress_mode: Literal["score", "tokens"] = "score",
 ) -> List[Dict]:
     """
     Coarse-to-fine zoom detection with an optional relative resolution multiplier.
@@ -1126,6 +1328,12 @@ def run_zoom_detector(
 
     ``options`` bundles the score mode (mean/knn + local contrast) and the mask
     method (adaptive/hysteresis); see ``AnomalyOptions``.
+
+    ``suppress_mask`` is an optional boolean mask in ORIGINAL frame coordinates
+    (letterbox bars included, same size as ``image``) with the already found
+    objects. It is cropped into every view so their patches leave the reference
+    pool and cannot be reported again; ``suppress_mode="tokens"`` also replaces
+    their tokens with the mean of the surviving ones (see ``_run_dino_heatmap``).
 
     When ``trace`` is a list, one record per DINO view is appended in depth-first
     order with keys:
@@ -1157,6 +1365,7 @@ def run_zoom_detector(
     x0, y0, x1, y1 = letterbox_box(image)
     W, H = image.size
     view = image.crop((x0, y0, x1, y1))
+    view_suppress = _crop_letterbox_mask(image, suppress_mask)
     points: list[RawPoint] = []
 
     def recurse(img: Image.Image, ox: int, oy: int, depth: int) -> None:
@@ -1167,12 +1376,23 @@ def run_zoom_detector(
             entry = {"depth": depth, "origin": (ox, oy), "size": (w, h)}
             trace.append(entry)
         pass_kwargs = {} if entry is None else {"trace": entry}
+        view_mask = (
+            None
+            if view_suppress is None
+            else view_suppress[oy : oy + h, ox : ox + w]
+        )
+        suppress_kwargs = (
+            {}
+            if view_mask is None
+            else {"suppress_mask": view_mask, "suppress_mode": suppress_mode}
+        )
         mask, norm_score = _dino_pass(
             img, model, processor, long_side, device,
             percentile_threshold=percentile_threshold,
             resolution_scale=resolution_scale,
             max_patches=max_patches,
             options=options,
+            **suppress_kwargs,
             **pass_kwargs,
         )
         _, regions = extract_salient_regions(
@@ -1247,6 +1467,487 @@ def run_zoom_detector(
             }
         )
     return detections
+
+
+def _dilate_mask(mask: np.ndarray, dilate_px: int) -> np.ndarray:
+    """Dilates a boolean mask with an ellipse kernel (no-op for dilate_px <= 0)."""
+    mask = np.asarray(mask, dtype=bool)
+    if dilate_px <= 0:
+        return mask.copy()
+    size = 2 * int(dilate_px) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    return cv2.dilate(mask.astype(np.uint8), kernel) > 0
+
+
+def mask_from_detections(
+    detections: List[Dict],
+    size: Tuple[int, int],
+    dilate_px: int = 0,
+    shape: Literal["bbox", "radius"] = "bbox",
+    radius_scale: float = 1.5,
+) -> np.ndarray:
+    """Rasterizes normalized DINO detections into a frame-resolution bool mask.
+
+    ``size`` is the (W, H) the detections are normalized to (the ORIGINAL frame
+    for ``run_zoom_detector`` outputs). ``shape='bbox'`` fills each detection's
+    tight box (``shape='radius'`` ignores the bbox and uses a circle of
+    ``det['radius'] * max(W, H) * radius_scale`` around the center, e.g. the
+    fallback when a SAM3 mask is rejected).
+    """
+    width, height = size
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for det in detections:
+        box = det.get("bbox")
+        if shape == "bbox" and box is not None:
+            bx0, by0, bx1, by1 = box
+            x0 = max(0, int(np.floor(bx0 * width)))
+            y0 = max(0, int(np.floor(by0 * height)))
+            x1 = min(width, int(np.ceil(bx1 * width)))
+            y1 = min(height, int(np.ceil(by1 * height)))
+            if x1 > x0 and y1 > y0:
+                mask[y0:y1, x0:x1] = 255
+            continue
+
+        radius = float(det["radius"]) * max(width, height) * radius_scale
+        center = (int(round(det["x"] * width)), int(round(det["y"] * height)))
+        cv2.circle(mask, center, max(1, int(round(radius))), 255, -1)
+    return _dilate_mask(mask > 0, dilate_px)
+
+
+def suppress_regions(
+    score: np.ndarray, mask: np.ndarray, fill_value: Optional[float] = None
+) -> np.ndarray:
+    """Returns a copy of a score map with the masked pixels pinned to its minimum.
+
+    The score-space counterpart of ``erase_regions``: later iterations cannot
+    find the suppressed regions again, but the frame pixels are never touched.
+    """
+    out = score.copy()
+    if fill_value is None:
+        fill_value = float(score.min())
+    out[np.asarray(mask, dtype=bool)] = fill_value
+    return out
+
+
+def _paste_water_patch(
+    arr: np.ndarray, binary: np.ndarray, feather_px: float, offset: float
+) -> np.ndarray:
+    """Erases a mask by pasting a nearby same-size patch of unmasked pixels.
+
+    Tries right, left, down, up and the four diagonals at ``offset`` times the
+    mask box size, and takes the first source rectangle that stays inside the
+    image and does not overlap the mask. Falls back to Telea inpainting when no
+    clean source exists (e.g. the mask spans the frame).
+    """
+    height, width = arr.shape[:2]
+    ys, xs = np.nonzero(binary)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    box_h, box_w = y1 - y0, x1 - x0
+    dy = int(round(box_h * offset))
+    dx = int(round(box_w * offset))
+
+    candidates = [
+        (0, dx),
+        (0, -dx),
+        (dy, 0),
+        (-dy, 0),
+        (dy, dx),
+        (dy, -dx),
+        (-dy, dx),
+        (-dy, -dx),
+    ]
+    for cy, cx in candidates:
+        sy0, sy1 = y0 + cy, y1 + cy
+        sx0, sx1 = x0 + cx, x1 + cx
+        if sy0 < 0 or sx0 < 0 or sy1 > height or sx1 > width:
+            continue
+        if binary[sy0:sy1, sx0:sx1].any():
+            continue
+        patch = arr[sy0:sy1, sx0:sx1]
+        alpha = cv2.GaussianBlur(
+            binary.astype(np.float32), (0, 0), max(1.0, float(feather_px))
+        )
+        alpha = np.clip(alpha, 0.0, 1.0)[y0:y1, x0:x1][..., None]
+        out = arr.copy()
+        region = out[y0:y1, x0:x1].astype(np.float32)
+        blended = region * (1 - alpha) + patch.astype(np.float32) * alpha
+        out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
+        return out
+
+    return cv2.inpaint(arr, binary.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
+
+
+def erase_regions(
+    image: Image.Image,
+    mask: np.ndarray,
+    mode: Literal["inpaint", "patch"] = "inpaint",
+    inpaint_radius: int = 3,
+    feather_px: float = 5.0,
+    patch_offset: float = 1.25,
+) -> Image.Image:
+    """Erases a boolean mask from a PIL image so DINO cannot see it anymore.
+
+    ``mode='inpaint'`` uses OpenCV Telea (smooth fill, may leave a uniform
+    'hole' the detector can find again); ``mode='patch'`` pastes a nearby
+    same-size patch of unmasked pixels with a feathered edge (textured, but it
+    could import another object). Both return a new image; the input is never
+    modified. Use ``dilate_px`` upstream (``mask_from_detections``) to cover the
+    ViT patch around the object.
+    """
+    if mode not in ("inpaint", "patch"):
+        raise ValueError("mode must be 'inpaint' or 'patch'")
+
+    arr = np.asarray(image.convert("RGB")).copy()
+    binary = np.asarray(mask) > 0
+    if binary.shape != arr.shape[:2]:
+        raise ValueError("mask must match the image size")
+    if not binary.any():
+        return image.copy()
+
+    if mode == "inpaint":
+        out = cv2.inpaint(arr, binary.astype(np.uint8) * 255, inpaint_radius, cv2.INPAINT_TELEA)
+    else:
+        out = _paste_water_patch(arr, binary, feather_px, patch_offset)
+    return Image.fromarray(out)
+
+
+def _split_new_detections(
+    detections: List[Dict],
+    suppressed_mask: np.ndarray,
+    min_score: Optional[float],
+    min_solidity: Optional[float],
+    min_area: Optional[float],
+    dedupe_overlap: float,
+) -> Tuple[List[Dict], List[Dict]]:
+    """Splits detections into (new, leaked) relative to an accumulated mask.
+
+    ``leaked`` are raw detections whose center falls inside a region erased by a
+    previous iteration — the artifact signal of the erase-and-rerun loop.
+    """
+    frame_outputs = {
+        "out_binary_masks": np.asarray(suppressed_mask, dtype=bool)[None, ...]
+    }
+    leaked = [
+        det
+        for det in detections
+        if point_in_existing_mask(det, frame_outputs)
+    ]
+    new = select_new_points(
+        detections,
+        frame_outputs=frame_outputs,
+        min_score=min_score,
+        min_solidity=min_solidity,
+        min_area=min_area,
+        dedupe_overlap=dedupe_overlap,
+    )
+    return new, leaked
+
+
+def run_dino_erase_loop(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    max_iterations: int = 3,
+    erase_mode: Literal["inpaint", "patch"] = "inpaint",
+    mask_fn: Optional[Callable[[List[Dict], Image.Image], np.ndarray]] = None,
+    dilate_px: int = 0,
+    min_score: Optional[float] = None,
+    min_solidity: Optional[float] = None,
+    min_area: Optional[float] = None,
+    dedupe_overlap: float = 0.3,
+    stop_on_no_new: bool = True,
+    long_side: int = 1024,
+    resolution_scale: float = 4.0,
+    max_patches: int = DEFAULT_MAX_PATCHES,
+    merge_gap: float = 0.0,
+    min_zone_fraction: float = 0.0,
+    min_confirmations: int = 1,
+    options: AnomalyOptions = AnomalyOptions(),
+    device: Optional[str] = None,
+) -> List[Dict]:
+    """Detect → erase → re-detect loop on ONE frame (the image is never modified).
+
+    Every iteration runs ``run_zoom_detector`` on the current image, keeps the
+    detections that are not inside an already erased region, erases them (image
+    inpaint / nearby patch) and repeats, so the next pass scores a frame where
+    the strongest anomalies are gone.
+
+    ``mask_fn(detections, image) -> bool mask`` builds the erase mask for the
+    accepted detections (e.g. ``sam3_utils.detection_erase_mask`` with a SAM3
+    image processor); when omitted, the DINO detection boxes are used. The union
+    mask is dilated by ``dilate_px`` to cover the ViT patch around the object.
+
+    Returns one dict per iteration with keys:
+        - 'iteration': 0 is the unmodified baseline.
+        - 'image': the image the detector ran on (previous erase already applied).
+        - 'detections': raw detector output.
+        - 'new_detections': accepted candidates not covered by ``suppressed_mask``
+          (tagged with 'iteration').
+        - 'leaked_detections': raw detections inside the already erased mask —
+          artifacts of a poor erase (inpaint hole, pasted texture seam).
+        - 'mask': this iteration's erase mask (bool, original frame size).
+        - 'suppressed_mask': union of the previous iterations' masks.
+        - 'accumulated_mask': union including this iteration.
+        - 'erased_image': the input for the next iteration.
+    """
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    width, height = image.size
+    suppressed = np.zeros((height, width), dtype=bool)
+    current = image
+    records: List[Dict] = []
+
+    for iteration in range(max_iterations):
+        detections = run_zoom_detector(
+            current,
+            model,
+            processor,
+            long_side=long_side,
+            resolution_scale=resolution_scale,
+            max_patches=max_patches,
+            merge_gap=merge_gap,
+            min_zone_fraction=min_zone_fraction,
+            min_confirmations=min_confirmations,
+            options=options,
+            device=device,
+        )
+        new, leaked = _split_new_detections(
+            detections, suppressed, min_score, min_solidity, min_area, dedupe_overlap
+        )
+        for det in new:
+            det["iteration"] = iteration
+
+        if new:
+            if mask_fn is None:
+                mask = mask_from_detections(new, (width, height))
+            else:
+                mask = np.asarray(mask_fn(new, current), dtype=bool)
+                if mask.shape != (height, width):
+                    raise ValueError(
+                        "mask_fn must return a mask with the image size"
+                    )
+            mask = _dilate_mask(mask, dilate_px)
+        else:
+            mask = np.zeros((height, width), dtype=bool)
+
+        record = {
+            "iteration": iteration,
+            "image": current,
+            "detections": detections,
+            "new_detections": new,
+            "leaked_detections": leaked,
+            "mask": mask,
+            "suppressed_mask": suppressed,
+            "accumulated_mask": suppressed | mask,
+        }
+        if new:
+            current = erase_regions(current, mask, mode=erase_mode)
+        record["erased_image"] = current
+        records.append(record)
+
+        if not new:
+            if stop_on_no_new:
+                break
+            continue
+        suppressed = suppressed | mask
+
+    return records
+
+
+def run_dino_suppress_loop(
+    image: Image.Image,
+    model: AutoModel,
+    processor: AutoImageProcessor,
+    max_iterations: int = 3,
+    suppress_mode: Literal["score", "tokens"] = "score",
+    dilate_px: int = 0,
+    min_score: Optional[float] = None,
+    min_solidity: Optional[float] = None,
+    min_area: Optional[float] = None,
+    dedupe_overlap: float = 0.3,
+    stop_on_no_new: bool = True,
+    long_side: int = 1024,
+    resolution_scale: float = 4.0,
+    max_patches: int = DEFAULT_MAX_PATCHES,
+    merge_gap: float = 0.0,
+    min_zone_fraction: float = 0.0,
+    min_confirmations: int = 1,
+    options: AnomalyOptions = AnomalyOptions(),
+    device: Optional[str] = None,
+) -> List[Dict]:
+    """Iterative zoom detector with score/token suppression instead of erasing.
+
+    Same records and diagnostics as ``run_dino_erase_loop``, but the frame pixels
+    are never touched: from the second iteration on, every view excludes the
+    already found regions from its reference pool (``suppress_mode='score'``) or
+    also replaces their tokens with the mean of the surviving ones
+    (``'tokens'``) — the cheap in-model counterparts of the inpaint loop.
+    """
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    width, height = image.size
+    suppressed = np.zeros((height, width), dtype=bool)
+    records: List[Dict] = []
+
+    for iteration in range(max_iterations):
+        detections = run_zoom_detector(
+            image,
+            model,
+            processor,
+            long_side=long_side,
+            resolution_scale=resolution_scale,
+            max_patches=max_patches,
+            merge_gap=merge_gap,
+            min_zone_fraction=min_zone_fraction,
+            min_confirmations=min_confirmations,
+            options=options,
+            device=device,
+            suppress_mask=suppressed if suppressed.any() else None,
+            suppress_mode=suppress_mode,
+        )
+        new, leaked = _split_new_detections(
+            detections, suppressed, min_score, min_solidity, min_area, dedupe_overlap
+        )
+        for det in new:
+            det["iteration"] = iteration
+
+        mask = (
+            _dilate_mask(mask_from_detections(new, (width, height)), dilate_px)
+            if new
+            else np.zeros((height, width), dtype=bool)
+        )
+        records.append(
+            {
+                "iteration": iteration,
+                "image": image,
+                "detections": detections,
+                "new_detections": new,
+                "leaked_detections": leaked,
+                "mask": mask,
+                "suppressed_mask": suppressed,
+                "accumulated_mask": suppressed | mask,
+            }
+        )
+        if not new:
+            if stop_on_no_new:
+                break
+            continue
+        suppressed = suppressed | mask
+
+    return records
+
+
+def _draw_detection_markers(
+    ax, detections: List[Dict], size: Tuple[int, int], color: str, marker: str = "o"
+) -> None:
+    """Draws detection centers (and thin bboxes) on a matplotlib axis."""
+    width, height = size
+    for det in detections:
+        x, y = det["x"] * width, det["y"] * height
+        ax.scatter(
+            [x],
+            [y],
+            s=70,
+            facecolors="none",
+            edgecolors=color,
+            marker=marker,
+            linewidths=1.6,
+            zorder=6,
+        )
+        box = det.get("bbox")
+        if box is not None:
+            bx0, by0, bx1, by1 = box
+            ax.add_patch(
+                plt.Rectangle(
+                    (bx0 * width, by0 * height),
+                    (bx1 - bx0) * width,
+                    (by1 - by0) * height,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.0,
+                    alpha=0.8,
+                )
+            )
+
+
+def plot_erase_records(
+    image: Image.Image,
+    records: List[Dict],
+    overlay_color: Tuple[int, int, int] = (255, 40, 40),
+    alpha: float = 0.35,
+) -> None:
+    """Plots one loop record per panel plus an iteration-colored summary.
+
+    Each panel shows the image the detector saw, the already suppressed regions
+    (red), this iteration's newly erased mask (yellow), the accepted detections
+    (lime) and the leaked ones (red x) — a leaked candidate inside an erased
+    region is an erase artifact, not a new animal.
+    """
+    if not records:
+        raise ValueError("records must not be empty")
+
+    base = np.asarray(image.convert("RGB"))
+    height, width = base.shape[:2]
+    n = len(records)
+    fig, axes = plt.subplots(1, n + 1, figsize=(5 * (n + 1), 5), squeeze=False)
+    axes = axes[0]
+
+    for ax, record in zip(axes[:n], records):
+        panel_img = record.get("image", image)
+        panel = np.asarray(panel_img.convert("RGB")).copy()
+        for key, color in (("suppressed_mask", overlay_color), ("mask", (255, 220, 0))):
+            mask = record.get(key)
+            if mask is not None and np.any(mask):
+                overlay = panel.copy()
+                overlay[np.asarray(mask, dtype=bool)] = color
+                panel = cv2.addWeighted(panel, 1 - alpha, overlay, alpha, 0)
+        ax.imshow(panel)
+        _draw_detection_markers(ax, record.get("new_detections", []), (width, height), "lime")
+        _draw_detection_markers(
+            ax,
+            record.get("leaked_detections", []),
+            (width, height),
+            "red",
+            marker="x",
+        )
+        ax.set_title(
+            f"iter {record['iteration']}: "
+            f"{len(record.get('new_detections', []))} new, "
+            f"{len(record.get('leaked_detections', []))} leaked"
+        )
+        ax.axis("off")
+
+    ax = axes[-1]
+    panel = base.copy()
+    cmap = plt.get_cmap("tab10")
+    for index, record in enumerate(records):
+        color = np.array(cmap(index % 10)[:3]) * 255
+        mask = record.get("mask")
+        if mask is not None and np.any(mask):
+            overlay = panel.copy()
+            overlay[np.asarray(mask, dtype=bool)] = color
+            panel = cv2.addWeighted(panel, 1 - alpha, overlay, alpha, 0)
+    ax.imshow(panel)
+    for index, record in enumerate(records):
+        color = np.array(cmap(index % 10)[:3])
+        for det in record.get("new_detections", []):
+            ax.scatter(
+                [det["x"] * width],
+                [det["y"] * height],
+                s=80,
+                facecolors="none",
+                edgecolors=color,
+                linewidths=1.8,
+                zorder=6,
+            )
+    ax.set_title("accumulated erasures + detections by iteration")
+    ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_detection_results(

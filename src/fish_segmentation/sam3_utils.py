@@ -171,6 +171,124 @@ def next_obj_id(outputs_per_frame: dict) -> int:
     return max_id + 1
 
 
+def _to_numpy(value):
+    """Converts a (possibly CUDA/bf16) torch tensor to numpy, leaves arrays alone."""
+    if value is None:
+        return None
+    for attr in ("detach", "cpu"):
+        if hasattr(value, attr):
+            value = getattr(value, attr)()
+    return np.asarray(value)
+
+
+def segment_boxes(processor, image, boxes, label: bool = True) -> List[dict]:
+    """Segments normalized boxes with the SAM3 IMAGE processor, one at a time.
+
+    ``processor`` is a ``Sam3Processor`` (image-model path, see
+    ``notebooks/05_smoke_test.ipynb``); this wrapper is duck-typed, so tests can
+    pass a fake. ``boxes`` are ``[cx, cy, w, h]`` normalized [0, 1] (SAM3's
+    geometric-prompt convention — convert DINO ``[x0, y0, x1, y1]`` boxes with
+    ``_bbox_to_cxcywh``). Every box is reset before the next one because the
+    processor accumulates geometric prompts in the same state.
+
+    Returns one dict per box: ``{'mask': bool HxW or None, 'score': float}``,
+    keeping the best (highest-score) mask of each box.
+    """
+    state = processor.set_image(image)
+    results = []
+    for box in boxes:
+        out = processor.add_geometric_prompt(box=list(box), label=label, state=state)
+        masks = _to_numpy(out.get("masks"))
+        scores = _to_numpy(out.get("scores"))
+
+        best = None
+        if masks is not None and masks.size and scores is not None and scores.size:
+            if masks.ndim == 4:  # (N, 1, H, W)
+                masks = masks[:, 0]
+            elif masks.ndim == 2:  # (H, W)
+                masks = masks[None]
+            scores = scores.reshape(-1)
+            if masks.ndim == 3 and masks.shape[0] > 0 and scores.size > 0:
+                count = min(masks.shape[0], scores.size)
+                index = int(np.argmax(scores[:count]))
+                best = {
+                    "mask": masks[index].astype(bool),
+                    "score": float(scores[index]),
+                }
+        results.append(best or {"mask": None, "score": 0.0})
+        processor.reset_all_prompts(state)
+    return results
+
+
+def _bbox_to_cxcywh(box) -> List[float]:
+    """Normalized ``[x0, y0, x1, y1]`` -> clamped ``[cx, cy, w, h]``."""
+    x0 = min(max(float(box[0]), 0.0), 1.0)
+    y0 = min(max(float(box[1]), 0.0), 1.0)
+    x1 = min(max(float(box[2]), 0.0), 1.0)
+    y1 = min(max(float(box[3]), 0.0), 1.0)
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    return [(x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0]
+
+
+def detection_erase_mask(
+    processor,
+    image,
+    detections: List[dict],
+    max_area_fraction: float = 0.25,
+    min_score: float = 0.5,
+    fallback_shape: str = "bbox",
+    fallback_radius_scale: float = 1.5,
+) -> np.ndarray:
+    """Erase mask for DINO detections: SAM3 box segmentation + region fallback.
+
+    Runs ``segment_boxes`` with one box per detection (the normalized bbox) and
+    falls back to ``dinov3.mask_from_detections`` when SAM3 returns no mask, a
+    mask below ``min_score`` or one bigger than ``max_area_fraction`` of the
+    frame — a class-agnostic box prompt on open water often segments the whole
+    crop, which would erase real context. Returns a bool mask at the image
+    resolution (the union of accepted masks and fallback regions).
+    """
+    from fish_segmentation.dinov3 import mask_from_detections
+
+    width, height = image.size
+    prompt_indices = []
+    boxes = []
+    for index, det in enumerate(detections):
+        if det.get("bbox") is None:
+            continue
+        prompt_indices.append(index)
+        boxes.append(_bbox_to_cxcywh(det["bbox"]))
+
+    results = segment_boxes(processor, image, boxes) if boxes else []
+    result_by_det = dict(zip(prompt_indices, results))
+
+    frame_area = float(width * height)
+    union = np.zeros((height, width), dtype=bool)
+    fallback = []
+    for index, det in enumerate(detections):
+        result = result_by_det.get(index)
+        accepted = False
+        if result is not None and result["mask"] is not None:
+            area = int(np.count_nonzero(result["mask"]))
+            if result["score"] >= min_score and 0 < area <= max_area_fraction * frame_area:
+                union |= result["mask"]
+                accepted = True
+        if not accepted:
+            fallback.append(det)
+
+    if fallback:
+        union |= mask_from_detections(
+            fallback,
+            (width, height),
+            shape=fallback_shape,
+            radius_scale=fallback_radius_scale,
+        )
+    return union
+
+
 def _bbox_iou(a, b) -> float:
     """IoU of two normalized ``[x0, y0, x1, y1]`` boxes."""
     ax0, ay0, ax1, ay1 = a
