@@ -1674,9 +1674,10 @@ def run_dino_erase_loop(
     the strongest anomalies are gone.
 
     ``mask_fn(detections, image) -> bool mask`` builds the erase mask for the
-    accepted detections (e.g. ``sam3_utils.detection_erase_mask`` with a SAM3
-    image processor); when omitted, the DINO detection boxes are used. The union
-    mask is dilated by ``dilate_px`` to cover the ViT patch around the object.
+    accepted detections (e.g. ``partial(detection_erase_mask,
+    processor=<Sam3Processor>)``); when omitted, the DINO detection boxes are
+    used. The union mask is dilated by ``dilate_px`` to cover the ViT patch
+    around the object.
 
     Returns one dict per iteration with keys:
         - 'iteration': 0 is the unmodified baseline.

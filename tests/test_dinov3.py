@@ -298,15 +298,28 @@ def test_compute_anomaly_heatmap_suppress_mask_pins_and_pools():
     tokens[27] = strongest  # patch (3, 3), away from the suppressed border
     tokens[54] = runner_up  # patch (6, 6), far from the suppressed patch
 
-    plain = compute_anomaly_heatmap(tokens, (8, 8), (128, 128))
     suppressed = np.zeros((8, 8), dtype=bool)
     suppressed[3, 3] = True
+
+    # At grid resolution the pin and the pool swap are exact.
+    grid_plain = compute_anomaly_heatmap(tokens, (8, 8), (8, 8))
+    grid_rerun = compute_anomaly_heatmap(
+        tokens, (8, 8), (8, 8), suppress_mask=suppressed
+    )
+    assert grid_plain[3, 3] == grid_plain.max()
+    assert grid_rerun[3, 3] == grid_rerun.min(), "suppressed patch pinned to the min"
+    assert grid_rerun[6, 6] == grid_rerun.max(), "runner-up takes over"
+
+    plain = compute_anomaly_heatmap(tokens, (8, 8), (128, 128))
     rerun = compute_anomaly_heatmap(tokens, (8, 8), (128, 128), suppress_mask=suppressed)
 
     strongest_center = (slice(52, 60), slice(52, 60))
     runner_up_center = (slice(100, 108), slice(100, 108))
     assert plain[strongest_center].mean() > plain[runner_up_center].mean()
-    assert rerun[strongest_center].max() < 0.1, "suppressed patch must be pinned to the min"
+    # At pixel resolution bicubic ringing puts raw.min() below zero, so the final
+    # min-max normalization lifts the pinned floor to ~0.1 (measured 0.1001):
+    # absolute thresholds are meaningless here, compare against the survivor.
+    assert rerun[strongest_center].max() < 0.25 * rerun[runner_up_center].mean()
     assert rerun[runner_up_center].mean() > 0.1, "runner-up must survive"
 
     with pytest.raises(ValueError):

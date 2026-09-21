@@ -178,6 +178,8 @@ def _to_numpy(value):
     for attr in ("detach", "cpu"):
         if hasattr(value, attr):
             value = getattr(value, attr)()
+    if hasattr(value, "float"):  # bf16/fp16 tensors have no numpy dtype
+        value = value.float()
     return np.asarray(value)
 
 
@@ -234,15 +236,19 @@ def _bbox_to_cxcywh(box) -> List[float]:
 
 
 def detection_erase_mask(
-    processor,
-    image,
     detections: List[dict],
+    image,
+    processor,
     max_area_fraction: float = 0.25,
     min_score: float = 0.5,
     fallback_shape: str = "bbox",
     fallback_radius_scale: float = 1.5,
 ) -> np.ndarray:
     """Erase mask for DINO detections: SAM3 box segmentation + region fallback.
+
+    The signature matches ``run_dino_erase_loop``'s ``mask_fn(detections, image)``
+    convention, so the loop takes it directly as
+    ``partial(detection_erase_mask, processor=processor, ...)``.
 
     Runs ``segment_boxes`` with one box per detection (the normalized bbox) and
     falls back to ``dinov3.mask_from_detections`` when SAM3 returns no mask, a

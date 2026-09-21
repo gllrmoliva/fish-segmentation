@@ -62,7 +62,9 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
   (SAM3 constructor-argument reference), `07_dinov3_zoom_levels` (zoom trace),
   `08_dinov3_heatmap_ab` (score/mask A/B), `09_dino_sam_tracking` (DINO points
   as SAM3 tracker prompts), `10_dino_sam_incremental` (DINO every N frames
-  against the live SAM3 session: new candidates become new masklets mid-video).
+  against the live SAM3 session: new candidates become new masklets mid-video),
+  `11_dino_erase_rerun` (single-frame baseline vs erase/suppress A/B with SAM3
+  erase masks).
   Outputs go to `notebooks/outputs/` (gitignored).
   `notebooks/reference/sam3_video_predictor.ipynb` is the upstream Meta demo,
   reference only — do not execute or develop in it.

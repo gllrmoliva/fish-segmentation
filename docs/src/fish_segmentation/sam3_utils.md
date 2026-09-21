@@ -3,7 +3,8 @@
 ## Purpose
 
 Session-level helpers for the SAM3 video predictors (both `build_sam3_video_predictor`
-and the multiplex variant — both expose the same `handle_request`/`handle_stream_request` API).
+and the multiplex variant — both expose the same `handle_request`/`handle_stream_request` API),
+plus the image-model box helpers used to build DINO erase masks.
 
 ## Functions
 
@@ -15,6 +16,8 @@ and the multiplex variant — both expose the same `handle_request`/`handle_stre
 | `select_new_points(detections, frame_outputs=None, min_score=None, min_solidity=None, min_area=None, mask_margin_px=0, dedupe_overlap=0.3) -> list[dict]` | Filters DINO detections down to points that should start new masklets: quality thresholds, containment in the masks tracked on that frame, and bbox-IoU NMS among the survivors (highest `score_mean` wins). Used by the incremental notebook. |
 | `point_in_existing_mask(det, frame_outputs, mask_margin_px=0) -> bool` | True when a detection center falls inside a tracked mask of that frame; `mask_margin_px` widens every mask (square window) so a point on a tracked animal's edge still counts as covered. Off-frame points are treated as covered. |
 | `next_obj_id(outputs_per_frame) -> int` | Smallest unused `obj_id` across a frame→outputs mapping (`0` when empty). |
+| `segment_boxes(processor, image, boxes, label=True) -> list[dict]` | Runs the SAM3 image-model processor (`Sam3Processor`) with one normalized `[cx, cy, w, h]` box prompt at a time — `reset_all_prompts` between boxes — and keeps the best mask per box: `{'mask': bool HxW or None, 'score': float}`. Duck-typed (no sam3 import). |
+| `detection_erase_mask(detections, image, processor, max_area_fraction=0.25, min_score=0.5, fallback_shape="bbox", fallback_radius_scale=1.5) -> bool HxW` | Erase mask for DINO detections: one SAM3 box prompt per detection (converted with `_bbox_to_cxcywh`), falling back to the DINO bbox/circle when SAM3 returns no mask, a score below `min_score` or an area above `max_area_fraction` of the frame (a class-agnostic box on open water can segment the whole crop). The signature matches `run_dino_erase_loop`'s `mask_fn(detections, image)` convention, so `partial(detection_erase_mask, processor=...)` plugs in directly. |
 
 ## Gotchas
 
@@ -52,3 +55,18 @@ and the multiplex variant — both expose the same `handle_request`/`handle_stre
   area are dropped from the outputs (`_postprocess_output`), and there is no
   per-frame tracker score exposed, so backfilled garbage masks cannot be filtered
   by score downstream.
+- `segment_boxes`/`detection_erase_mask` are the IMAGE-model path, not the video
+  session helpers: they take a `Sam3Processor` (see `notebooks/05_smoke_test.ipynb`)
+  and a PIL image, and never touch a session.
+- `segment_boxes` resets the geometric prompts after every box because
+  `Sam3Processor` accumulates them in the same state — without the reset the
+  second box would segment the union of both.
+- `detection_erase_mask` skips SAM3 for detections without `bbox` and goes
+  straight to the fallback (bbox or circle), so it also works for region-style
+  detections; the accepted area cap is checked against the whole frame.
+- SAM3 image-model inference must run under `torch.autocast("cuda",
+  dtype=torch.bfloat16)` (as `notebooks/05_smoke_test.ipynb` and
+  `notebooks/11_dino_erase_rerun.ipynb` do): the vendored ViT MLP
+  (`sam3/perflib/fused.py:addmm_act`) hardcodes bf16 activations against fp32
+  weights, so without autocast the first `fc2` raises a dtype mismatch, and the
+  bf16 outputs then need the `_to_numpy` fp32 cast before `.numpy()`.

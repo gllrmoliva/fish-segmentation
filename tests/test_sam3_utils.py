@@ -4,6 +4,7 @@ import numpy as np
 
 from fish_segmentation.sam3_utils import (
     _bbox_to_cxcywh,
+    _to_numpy,
     add_point_prompt,
     detection_erase_mask,
     next_obj_id,
@@ -256,6 +257,27 @@ def test_bbox_to_cxcywh_clamps_and_orders():
     assert _bbox_to_cxcywh((0.5, 0.9, 0.1, 0.2)) == [0.3, 0.55, 0.4, 0.7]
 
 
+def test_to_numpy_casts_bf16_tensor():
+    """Under bf16 autocast the SAM3 outputs are bf16 and .numpy() would reject them."""
+
+    class FakeBf16Tensor:
+        dtype = "torch.bfloat16"
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def float(self):
+            return np.array([0.25, 0.5], dtype=np.float32)
+
+    assert np.allclose(_to_numpy(FakeBf16Tensor()), [0.25, 0.5])
+    assert _to_numpy(None) is None
+    plain = np.array([1.0, 2.0])
+    assert _to_numpy(plain) is plain
+
+
 def _image_100():
     from PIL import Image
 
@@ -280,7 +302,7 @@ def test_detection_erase_mask_falls_back_on_large_or_weak_masks():
     ]
 
     union = detection_erase_mask(
-        processor, _image_100(), detections, max_area_fraction=0.25, min_score=0.5
+        detections, _image_100(), processor, max_area_fraction=0.25, min_score=0.5
     )
 
     assert union[10:20, 10:20].all(), "rejected giant mask must fall back to the bbox"
@@ -290,9 +312,9 @@ def test_detection_erase_mask_falls_back_on_large_or_weak_masks():
     # a low-confidence mask is rejected too
     processor = FakeImageProcessor([{"masks": small, "scores": np.array([0.1])}])
     union = detection_erase_mask(
-        processor,
-        _image_100(),
         [_det(0.15, 0.15, bbox=(0.1, 0.1, 0.2, 0.2))],
+        _image_100(),
+        processor,
         min_score=0.5,
     )
     assert union[10:20, 10:20].all()
@@ -302,7 +324,7 @@ def test_detection_erase_mask_without_bbox_skips_sam3():
     processor = FakeImageProcessor([])
 
     union = detection_erase_mask(
-        processor, _image_100(), [{"x": 0.5, "y": 0.5, "radius": 0.1, "bbox": None}]
+        [{"x": 0.5, "y": 0.5, "radius": 0.1, "bbox": None}], _image_100(), processor
     )
 
     assert union.any()

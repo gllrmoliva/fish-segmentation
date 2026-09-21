@@ -35,6 +35,10 @@ Support files:
 - [notebooks/10_dino_sam_incremental.md](notebooks/10_dino_sam_incremental.md) —
   DINO every N frames against the live SAM3 session: new candidates are added as
   new masklets mid-video (backfill + forward) instead of prompting only once.
+- [notebooks/11_dino_erase_rerun.md](notebooks/11_dino_erase_rerun.md) — baseline
+  vs erase (inpaint/patch) vs score/token suppression on one frame: iterative
+  detect → erase/suppress → re-detect to surface weaker peaks, with
+  `leaked_detections` as the erase-artifact diagnostic.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 

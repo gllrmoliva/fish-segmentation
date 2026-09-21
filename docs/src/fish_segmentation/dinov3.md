@@ -38,23 +38,29 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
 4. Heatmap: `compute_anomaly_heatmap(tokens, grid_shape, target_shape,
    max_sample_pool=1500, border_margin_pct=0.05, normalize=True,
    score_mode="mean", knn_k=5, local_contrast_strength=0.0,
-   local_contrast_sigma_pct=0.05)` — `"mean"` scores 1 − mean cosine similarity
-   per token; `"knn"` scores 1 − mean of the top-k similarities (water repeats
-   everywhere so it keeps close neighbours, object patches do not). A fixed-seed
-   subsample of the reference pool keeps O(N·1500) instead of O(N²) and makes
-   runs reproducible. Local contrast subtracts a Gaussian-blurred copy of the
-   score map (unsharp/high-pass) to flatten the broad warm halo around peaks; it
-   is off by default. Border tokens are then zeroed (ViT border artifact), the
-   map is bicubic-upsampled to pixels and min-max normalized. `normalize=False`
-   returns raw scores, which tiled stitching uses.
+   local_contrast_sigma_pct=0.05, suppress_mask=None)` — `"mean"` scores 1 − mean
+   cosine similarity per token; `"knn"` scores 1 − mean of the top-k similarities
+   (water repeats everywhere so it keeps close neighbours, object patches do
+   not). A fixed-seed subsample of the reference pool keeps O(N·1500) instead of
+   O(N²) and makes runs reproducible. Local contrast subtracts a Gaussian-blurred
+   copy of the score map (unsharp/high-pass) to flatten the broad warm halo
+   around peaks; it is off by default. `suppress_mask` (bool, `grid_shape`) drops
+   already-found patches from the reference pool and pins their score to the map
+   minimum *after* local contrast (so the low values cannot bleed). Border tokens
+   are then zeroed (ViT border artifact), the map is bicubic-upsampled to pixels
+   and min-max normalized. `normalize=False` returns raw scores, which tiled
+   stitching uses.
 5. Mask: `segment_anomalies(norm_score, percentile_threshold=99.5,
    adaptive_block_size=21, morph_kernel_size=3, method="hysteresis",
-   low_percentile=98.0, closing_kernel_size=0)`. `"hysteresis"` (default) seeds
+   low_percentile=98.0, closing_kernel_size=0, valid_mask=None)`.
+   `"hysteresis"` (default) seeds
    with the top percentile and keeps every connected component of the
    lower-percentile mask that holds a seed (morphological reconstruction, done
    with `cv2.connectedComponents` so long thin bridges connect exactly), then
    applies the final morphological opening. `"adaptive"` is the legacy
-   top-percentile ∩ local adaptive core.
+   top-percentile ∩ local adaptive core. `valid_mask` computes the percentiles
+   only over valid pixels and forces the invalid ones to `-inf` in the working
+   map, so they can never enter the mask (even if a percentile collapses).
 6. Regions: `extract_salient_regions(binary_mask, method="otsu"|"iqr",
    iqr_k=1.5, min_absolute_pixels=20, score_map=None)` — connected components
    (8-connectivity), area thresholding (Otsu on log-areas, or IQR outlier rule),
@@ -86,6 +92,10 @@ the A/B-validated pipeline. `run_dino_detector`, `run_dino_view` and
    `min_confirmations=k` keeps only detections confirmed at k different recursion
    depths (default 1 = keep everything) and `keep_absorbed=True` re-emits
    absorbed coarse representatives for A/B comparisons.
+   `suppress_mask` (native frame coordinates, letterbox bars included) and
+   `suppress_mode` (`"score"`/`"tokens"`) propagate the iterative suppression to
+   every view: each view crops the mask, drops those patches from its local
+   reference pool and pins them after the stitched local contrast.
 
 ## Merge semantics (deepest-wins)
 
@@ -106,6 +116,42 @@ included, offset from `letterbox_box`) so detections are directly usable as SAM3
 point prompts (`rel_coordinates=True`). Each detection dict carries `x`, `y`,
 `radius`, `level`, `bbox` (normalized), `area`, `solidity`, `score_mean`,
 `score_p95`, `n_levels`, `levels` and `n_points`.
+
+## Erase & re-run (iterative detection)
+
+`notebooks/11_dino_erase_rerun.ipynb` compares four ways of re-running the zoom
+detector on one frame so weaker peaks can surface after the dominant one is
+removed. Helpers:
+
+- `mask_from_detections(detections, size, dilate_px=0, shape="bbox"|"radius",
+  radius_scale=1.5)` — bool mask at native size from detection boxes/circles.
+- `suppress_regions(score, mask, fill_value=None)` — pins a native mask to the
+  map minimum (or `fill_value`).
+- `erase_regions(image, mask, mode="inpaint"|"patch", inpaint_radius=3,
+  feather_px=5, patch_offset=1.25)` — `cv2.inpaint` fill or a feathered nearby
+  water patch; returns a new PIL image (the input is never modified).
+- `run_dino_erase_loop(image, model, processor, max_iterations=3,
+  erase_mode="inpaint"|"patch", mask_fn=None, dilate_px=0, min_score=None,
+  min_solidity=None, min_area=None, dedupe_overlap=0.3, stop_on_no_new=True,
+  ...)` — detect → erase → re-detect. `mask_fn(detections, image) -> bool mask`
+  builds the erase mask (e.g. `partial(sam3_utils.detection_erase_mask,
+  processor=<Sam3Processor>)`); without it the DINO boxes are used. The mask is
+  dilated by `dilate_px` (≥ 1 ViT patch at the detector's scale) so no mixed
+  patches are left at the object border.
+- `run_dino_suppress_loop(..., suppress_mode="score"|"tokens")` — same loop but
+  the pixels are never touched: `"score"` only excludes the found patches from
+  every view's reference pool and pins them; `"tokens"` also replaces their
+  tokens with the re-normalized mean of the survivors.
+- `plot_erase_records(image, records)` — one panel per iteration (previous
+  erasure red, new erasure yellow, accepted candidates lime, leaked candidates
+  red ✕) plus an iteration-colored summary.
+
+Both loops return one record per iteration (`iteration`, `image`, `detections`,
+`new_detections`, `leaked_detections`, `mask`, `suppressed_mask`,
+`accumulated_mask`, plus `erased_image` in the erase loop). Iteration 0 is the
+unmodified baseline. `leaked_detections` are raw detections inside the
+already-erased mask: artifacts of the erase (inpaint hole, patch seam), not
+animals — the metric to watch.
 
 ## Visualization helpers
 
@@ -178,5 +224,22 @@ point prompts (`rel_coordinates=True`). Each detection dict carries `x`, `y`,
 - Enlarged/merged zones are still dropped when they exceed `max_zone_fraction`
   (0.8) of the view, so a chain of border blobs spanning the frame yields no zoom
   rather than a useless full-frame pass.
+- Erase masks must be dilated by ≥ 1 ViT patch at the detector's scale
+  (`ERASE_DILATE_PX≈12` at `resolution_scale=4.0` on the 4K footage); a mixed
+  patch at the object border re-detects the object on the next iteration.
+- Never "erase" tokens by zeroing them: `extract_patch_tokens` L2-normalizes, so
+  a zero vector has cosine similarity 0 with everything and scores as MAXIMUM
+  anomaly (the opposite of erasing). `replace_masked_tokens` substitutes the
+  re-normalized mean of the surviving tokens.
+- Suppression must remove the patch from the reference pool in addition to
+  pinning its score; otherwise the object keeps contaminating the "water"
+  reference and the contrast of the rest stays flat.
+- `cv2.inpaint` can leave a smooth hole more anomalous than the water, so the
+  next iteration may re-detect the hole (`leaked_detections` is exactly that
+  diagnostic); `erase_regions(mode="patch")` pastes nearby water instead.
+- At pixel resolution a pinned patch is not exactly 0 after min-max
+  normalization: bicubic ringing puts `raw.min()` below zero and the rescale
+  lifts the floor (~0.1 in synthetic tests). Pinning is exact on the patch grid;
+  do not assert absolute zeros on the normalized map.
 - The backbone `facebook/dinov3-vitl16-pretrain-lvd1689m` is a gated HF repo —
   `load_env()` first.
