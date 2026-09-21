@@ -66,7 +66,10 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
   `11_dino_erase_rerun` (single-frame baseline vs erase/suppress A/B with SAM3
   erase masks), `12_dino_sam_chunked` (chunked incremental: 150-frame sessions
   with 30 frames of overlap, objects carried across sessions by point prompts,
-  single merged export — bounded VRAM on long videos).
+  single merged export — bounded VRAM on long videos), `13_pipeline_e2e`
+  (end-to-end driver over `dataset/processed/`: optional ingest/enhance, DINO
+  keyframes, SAM3 in chunked/incremental/simple modes and verification plots;
+  notebook text in Spanish).
   Outputs go to `notebooks/outputs/` (gitignored).
   `notebooks/reference/sam3_video_predictor.ipynb` is the upstream Meta demo,
   reference only — do not execute or develop in it.

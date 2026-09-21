@@ -43,6 +43,11 @@ Support files:
   incremental DINO→SAM3: 150-frame chunks with 30 frames of overlap, one session
   per chunk (bounded VRAM) and object ids carried across sessions through the
   overlap, merged into a single masklet video + JSON.
+- [notebooks/13_pipeline_e2e.md](notebooks/13_pipeline_e2e.md) — end-to-end driver
+  over `dataset/processed/`: select/validate the processed video (optional
+  ingest + enhance), DINO keyframe detection with diagnostics, SAM3 tracking in
+  `chunked`/`incremental`/`simple` modes (points or text prompt) and PASS/FAIL
+  verification plots; all notebook text in Spanish.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 
