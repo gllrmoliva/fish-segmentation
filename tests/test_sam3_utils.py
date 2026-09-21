@@ -1,13 +1,18 @@
 """CPU-only checks for the SAM3 request wrappers (no model, no GPU)."""
 
 import numpy as np
+import pytest
 
 from fish_segmentation.sam3_utils import (
     _bbox_to_cxcywh,
     _to_numpy,
     add_point_prompt,
+    carry_over_points,
     detection_erase_mask,
+    merge_chunk_outputs,
     next_obj_id,
+    object_mask_area,
+    plan_chunks,
     point_in_existing_mask,
     propagate_in_video,
     segment_boxes,
@@ -204,6 +209,131 @@ def test_next_obj_id_scans_every_frame():
         )
         == 3
     )
+
+
+def test_plan_chunks_tiles_the_video_with_overlap():
+    chunks = plan_chunks(475, 150, 30)
+
+    assert chunks == [(0, 150), (120, 270), (240, 390), (360, 475)]
+
+    # ownership rule used by merge_chunk_outputs: later chunks own the overlap
+    owned = {}
+    for index, (start, end) in enumerate(chunks):
+        own_end = chunks[index + 1][0] if index + 1 < len(chunks) else end
+        for frame in range(start, own_end):
+            assert frame not in owned
+            owned[frame] = index
+    assert sorted(owned) == list(range(475))
+    assert owned[120] == 1 and owned[149] == 1 and owned[119] == 0
+
+
+def test_plan_chunks_short_video_is_one_chunk():
+    assert plan_chunks(120, 150, 30) == [(0, 120)]
+    assert plan_chunks(150, 150, 30) == [(0, 150)]
+    assert plan_chunks(0, 150, 30) == []
+    # last chunk may be shorter than the overlap; it still advances from the plan
+    assert plan_chunks(400, 150, 30) == [(0, 150), (120, 270), (240, 390), (360, 400)]
+
+
+def test_plan_chunks_validates_arguments():
+    with pytest.raises(ValueError):
+        plan_chunks(100, 0, 0)
+    with pytest.raises(ValueError):
+        plan_chunks(100, 30, -1)
+    with pytest.raises(ValueError):
+        plan_chunks(100, 30, 30)
+    with pytest.raises(ValueError):
+        plan_chunks(100, 30, 0, align=0)
+    # advance 20 is not a multiple of the keyframe stride 30
+    with pytest.raises(ValueError):
+        plan_chunks(100, 30, 10, align=30)
+    assert plan_chunks(100, 30, 10) == [(0, 30), (20, 50), (40, 70), (60, 90), (80, 100)]
+
+
+def test_carry_over_points_uses_interior_point():
+    masks = np.zeros((2, 8, 10), dtype=bool)
+    masks[0, 2:4, 3:5] = True  # obj 7
+    masks[1, 5:8, 1:4] = True  # obj 3
+    outputs = {"out_obj_ids": np.array([7, 3]), "out_binary_masks": masks}
+
+    points = carry_over_points(outputs)
+
+    assert [point["obj_id"] for point in points] == [3, 7]
+    assert points[0]["area"] == 9 and points[1]["area"] == 4
+    # deepest interior point of the blob, normalized to the mask resolution
+    assert 0.3 < points[1]["x"] < 0.6
+    assert 0.2 < points[1]["y"] < 0.5
+
+
+def test_carry_over_points_filters_empty_and_small_masks():
+    masks = np.zeros((3, 8, 10), dtype=bool)
+    masks[0, 1, 1] = True  # 1 px
+    masks[2, 2:6, 3:8] = True  # 20 px
+    outputs = {"out_obj_ids": np.array([0, 1, 2]), "out_binary_masks": masks}
+
+    points = carry_over_points(outputs, min_area=4)
+
+    assert len(points) == 1
+    point = points[0]
+    assert point["obj_id"] == 2 and point["area"] == 20
+    x = int(point["x"] * masks.shape[-1])
+    y = int(point["y"] * masks.shape[-2])
+    assert masks[2, y, x], "the carried point must fall inside the tracked mask"
+
+
+def test_carry_over_points_without_outputs():
+    assert carry_over_points(None) == []
+    assert carry_over_points({}) == []
+    assert (
+        carry_over_points(
+            {"out_obj_ids": np.array([]), "out_binary_masks": np.zeros((0, 4, 4), bool)}
+        )
+        == []
+    )
+
+
+def test_object_mask_area_finds_the_object():
+    masks = np.zeros((2, 5, 5), dtype=bool)
+    masks[1, 1:4, 1:4] = True
+    outputs = {"out_obj_ids": np.array([4, 9]), "out_binary_masks": masks}
+
+    assert object_mask_area(outputs, 9) == 9
+    assert object_mask_area(outputs, 4) == 0
+    assert object_mask_area(outputs, 99) == 0
+    assert object_mask_area(None, 9) == 0
+
+
+def test_merge_chunk_outputs_later_chunk_owns_the_overlap():
+    chunks = [(0, 150), (120, 270)]
+    first = {frame: {"chunk": 0} for frame in range(0, 150)}
+    second = {frame - 120: {"chunk": 1} for frame in range(120, 270)}
+
+    merged = merge_chunk_outputs([first, second], chunks)
+
+    assert sorted(merged) == list(range(270))
+    assert merged[0] == {"chunk": 0}
+    assert merged[119] == {"chunk": 0}
+    assert merged[120] == {"chunk": 1}
+    assert merged[149] == {"chunk": 1}
+    assert merged[269] == {"chunk": 1}
+
+
+def test_merge_chunk_outputs_keeps_unreached_overlap_frames():
+    """A newer chunk that never propagated keeps the older chunk's overlap frames."""
+    chunks = [(0, 150), (120, 270)]
+    first = {frame: {"chunk": 0} for frame in range(0, 150)}
+    second = {frame - 120: {"chunk": 1} for frame in range(135, 270)}  # misses 120..134
+
+    merged = merge_chunk_outputs([first, second], chunks)
+
+    assert merged[134] == {"chunk": 0}
+    assert merged[135] == {"chunk": 1}
+    assert sorted(merged) == list(range(270))
+
+
+def test_merge_chunk_outputs_length_mismatch():
+    with pytest.raises(ValueError):
+        merge_chunk_outputs([{}], [(0, 10), (5, 15)])
 
 
 class FakeImageProcessor:

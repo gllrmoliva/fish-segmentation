@@ -15,12 +15,14 @@ masklets without recomputing the existing tracks.
 1. `load_env()` + `ROOT = find_repo_root()`; device; same detector settings as
    09 plus the incremental knobs: `KEYFRAME_STRIDE`, `MAX_OBJECTS`,
    `MIN_SCORE`/`MIN_SOLIDITY`/`MIN_AREA`, `MASK_MARGIN_PX`, `DEDUPE_OVERLAP`.
+   The first cell sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 2. Build/reuse the 1024x576 proxy with `process_video` for the SAM3 session
    (4K per-frame mask caches OOM a 24 GB card) and read the original/proxy
    frame counts + original fps with OpenCV. Keyframe k of the session (15 fps)
    maps to the original by time: `orig_index = k * orig_fps / SESSION_FPS`.
 3. `load_backbone("facebook/dinov3-vitl16-pretrain-lvd1689m")`; build the SAM3
-   predictor and `start_session(resource_path=proxy)`.
+   predictor and `start_session(resource_path=proxy, offload_state_to_cpu=True,
+   offload_video_to_cpu=True)` (see Gotchas).
 4. Incremental loop over `keyframes = range(0, n_frames, KEYFRAME_STRIDE)`:
    `load_frame_rgb` on the ORIGINAL at `orig_index` (the 1024x576 proxy yields
    **zero** DINO detections on the dataset footage — verified — because the
@@ -31,7 +33,8 @@ masklets without recomputing the existing tracks.
    `obj_id = next_obj_id(outputs_per_frame) + i` → propagate. From keyframe 1 on
    the order is `"backward"` (backfill 0..k-1) and then `"forward"` (k..end);
    both passes are needed because a single `"both"` call does not backfill newly
-   added objects (SAM3 action history).
+   added objects (SAM3 action history). Each keyframe prints the VRAM
+   allocated/peak/free of the run.
 5. Per-keyframe review figure (keyframe downscaled to 1024x576): tracked masks
    as cyan contours, all DINO candidates in red, prompted ones in green.
 6. `save_masklet_video` on the proxy frames + JSON track log (discovery
@@ -45,25 +48,39 @@ masklets without recomputing the existing tracks.
 - Output: `notebooks/outputs/dino_sam_incremental_<dataset>_<stem>.mp4`,
   `..._tracks.json` and the 1024x576 proxy (all gitignored) + keyframe plots.
 
-## Verified end-to-end (smoke)
+## Verified end-to-end
 
-On an 8 s segment of the dataset 4K footage: 5 DINO detections at frame 0, then
-1/2/2 new objects prompted at keyframes 30/60/90 (the rest deduped against the
-tracked masks); 120/120 frames covered; the mid-video objects got masks before
-their discovery frame (backfill 21/30, 60/60 and 90/90 frames respectively) and
-after it; the existing tracks at frame 10 were unchanged (0 pixels).
+- Full 475-frame run on the dataset 4K footage (`KEYFRAME_STRIDE=30`,
+  `MAX_OBJECTS=24`): **22 masklets** prompted from 83 DINO candidates over 16
+  keyframes, peak **18.69 GiB** allocated (was a CUDA OOM at k=180 / 23.47 GiB
+  before the VRAM flags). The per-keyframe candidate/new counts up to k=180
+  reproduce the earlier partial run exactly (5/4/7/5/4/4/3 candidates and
+  5/1/2/2/1/0/0 new masklets).
+- On an 8 s segment of the dataset 4K footage: 5 DINO detections at frame 0, then
+  1/2/2 new objects prompted at keyframes 30/60/90 (the rest deduped against the
+  tracked masks); 120/120 frames covered; the mid-video objects got masks before
+  their discovery frame (backfill 21/30, 60/60 and 90/90 frames respectively) and
+  after it; the existing tracks at frame 10 were unchanged (0 pixels).
 
 ## Gotchas
 
+- VRAM: `start_session(offload_state_to_cpu=True)` keeps the per-frame tracker
+  state (`pred_masks` + `maskmem_features`, the tensors that grow with
+  objects x frames) in CPU RAM — this is what makes the full run fit, and the
+  notebook also prints allocated/peak/free VRAM per keyframe.
+  `offload_video_to_cpu=True` documents the frame-batch intent but is a no-op
+  with the default `cv2` loader (the batch is moved back to the GPU by
+  `_construct_initial_input_batch`). For videos long enough that even the
+  offloaded session grows too much, use `12_dino_sam_chunked.ipynb`.
 - DINO on the 1024x576 proxy detects nothing on this footage at any
   `resolution_scale` (1.0/2.0/4.0) — the keyframes must come from the original.
   Original and proxy are both aspect-preserving, so the relative detections feed
   the session unchanged.
 - Partial propagation is per new object, but the masks of already tracked
   objects are fetched from `cached_frame_outputs` — they are never recomputed.
-- The session grows with objects x frames (~0.3 GB of GPU cache + ~0.3 GB of
-  Python-side masks per object over 475 frames at 1024x576); `MAX_OBJECTS` caps
-  it and extra candidates are dropped for that keyframe.
+- The offloaded session still grows with objects x frames (~0.1 GiB per object
+  per 150 frames measured, mainly `cached_frame_outputs`); `MAX_OBJECTS` caps it
+  and extra candidates are dropped for that keyframe.
 - Backfilled masks on frames before an object actually appeared can be spurious;
   they cannot be filtered by score because SAM3 does not expose a per-frame
   tracker score in the outputs (empty masks are dropped).

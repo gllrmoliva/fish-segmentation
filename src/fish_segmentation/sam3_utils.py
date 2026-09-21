@@ -1,5 +1,6 @@
 from typing import Any, List, Optional
 
+import cv2
 import numpy as np
 
 
@@ -169,6 +170,152 @@ def next_obj_id(outputs_per_frame: dict) -> int:
             continue
         max_id = max(max_id, int(np.max(obj_ids)))
     return max_id + 1
+
+
+def plan_chunks(
+    n_frames: int,
+    chunk_frames: int,
+    overlap_frames: int,
+    align: int = 1,
+) -> List[tuple[int, int]]:
+    """Splits ``n_frames`` into overlapping ``(start, end)`` half-open chunk ranges.
+
+    ``chunk_frames`` is the nominal chunk length (the last chunk is clipped to
+    ``n_frames``); consecutive chunks advance by ``chunk_frames - overlap_frames``,
+    so they share ``overlap_frames`` frames of context. ``align`` (e.g. the DINO
+    keyframe stride) forces the advance to be a multiple of it, so the global
+    keyframe grid is identical in every chunk: it raises ``ValueError`` when the
+    advance is not a multiple.
+
+    Frames covered by several chunks belong to the LAST chunk that produced
+    outputs for them (see ``merge_chunk_outputs``), so the coverage of
+    ``[0, n_frames)`` stays gap-free.
+    """
+    if chunk_frames <= 0:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+    if overlap_frames < 0:
+        raise ValueError(f"overlap_frames cannot be negative, got {overlap_frames}")
+    if overlap_frames >= chunk_frames:
+        raise ValueError(
+            f"overlap_frames ({overlap_frames}) must be smaller than "
+            f"chunk_frames ({chunk_frames})"
+        )
+    if align < 1:
+        raise ValueError(f"align must be >= 1, got {align}")
+
+    advance = chunk_frames - overlap_frames
+    if align > 1 and advance % align != 0:
+        raise ValueError(
+            f"chunk advance ({advance}) is not a multiple of align ({align}); "
+            "pick chunk/overlap sizes that keep the global keyframe grid"
+        )
+
+    chunks = []
+    start = 0
+    while start < n_frames:
+        end = min(start + chunk_frames, n_frames)
+        chunks.append((start, end))
+        if end >= n_frames:
+            break
+        start += advance
+    return chunks
+
+
+def _mask_interior_point(mask) -> Optional[tuple[int, int]]:
+    """Pixel ``(x, y)`` of a bool mask's deepest interior point, None if empty.
+
+    Same rule as ``dinov3.extract_salient_regions``: the maximum of the euclidean
+    distance transform, so the point stays inside even for hollow/toroidal masks
+    (a plain centroid can fall outside).
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0 or not mask.any():
+        return None
+    distance = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    y, x = np.unravel_index(int(np.argmax(distance)), distance.shape)
+    return int(x), int(y)
+
+
+def carry_over_points(frame_outputs: Optional[dict], min_area: int = 0) -> List[dict]:
+    """Point prompts that carry every tracked object into a new session.
+
+    ``frame_outputs`` is the SAM3 outputs dict of ONE frame (``out_obj_ids`` /
+    ``out_binary_masks`` at session resolution, as returned by propagation). For
+    each non-empty mask of at least ``min_area`` pixels it emits
+    ``{"obj_id", "x", "y", "area"}`` with normalized ``[0, 1]`` coordinates of the
+    mask's interior point, ready for ``add_point_prompt(..., obj_id=...)``.
+
+    The chunked driver calls this on the first frame of the overlap between two
+    chunks: every object alive there gets re-prompted in the fresh session under
+    the SAME global ``obj_id``, so object identity survives the session restart.
+    """
+    if not frame_outputs:
+        return []
+    masks = np.asarray(frame_outputs.get("out_binary_masks"))
+    obj_ids = frame_outputs.get("out_obj_ids")
+    if masks.ndim != 3 or obj_ids is None or masks.shape[0] == 0:
+        return []
+
+    height, width = masks.shape[-2:]
+    points = []
+    for obj_id, mask in zip(np.asarray(obj_ids).reshape(-1), masks):
+        area = int(np.count_nonzero(mask))
+        if area == 0 or area < min_area:
+            continue
+        point = _mask_interior_point(mask)
+        if point is None:
+            continue
+        x, y = point
+        points.append(
+            {
+                "obj_id": int(obj_id),
+                "x": (x + 0.5) / width,
+                "y": (y + 0.5) / height,
+                "area": area,
+            }
+        )
+    points.sort(key=lambda point: point["obj_id"])
+    return points
+
+
+def object_mask_area(frame_outputs: Optional[dict], obj_id: int) -> int:
+    """Pixel area of ``obj_id``'s mask in one frame's outputs (0 if absent/empty)."""
+    if not frame_outputs:
+        return 0
+    masks = np.asarray(frame_outputs.get("out_binary_masks"))
+    obj_ids = frame_outputs.get("out_obj_ids")
+    if masks.ndim != 3 or obj_ids is None or masks.shape[0] == 0:
+        return 0
+    for current_id, mask in zip(np.asarray(obj_ids).reshape(-1), masks):
+        if int(current_id) == int(obj_id):
+            return int(np.count_nonzero(mask))
+    return 0
+
+
+def merge_chunk_outputs(
+    chunk_outputs: List[dict],
+    chunk_bounds: List[tuple[int, int]],
+) -> dict:
+    """Merges per-chunk frame outputs into one global ``frame -> outputs`` mapping.
+
+    ``chunk_bounds`` is the ``plan_chunks(...)`` list and ``chunk_outputs`` holds
+    one ``{local_frame_index: outputs}`` dict per chunk (session-local keys, in the
+    same order). Frames are written from the oldest chunk to the newest, so a frame
+    covered by several chunks is taken from the LAST chunk that actually produced
+    outputs for it (the overlap is rendered with the freshest session) while frames
+    a newer chunk never reached keep the older chunk's outputs instead of becoming
+    a gap.
+    """
+    if len(chunk_outputs) != len(chunk_bounds):
+        raise ValueError(
+            f"got {len(chunk_outputs)} chunk outputs for {len(chunk_bounds)} chunk bounds"
+        )
+
+    merged = {}
+    for (start, _), outputs in zip(chunk_bounds, chunk_outputs):
+        for local_index, frame_outputs in outputs.items():
+            merged[start + local_index] = frame_outputs
+    return merged
 
 
 def _to_numpy(value):

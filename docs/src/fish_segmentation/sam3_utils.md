@@ -16,6 +16,10 @@ plus the image-model box helpers used to build DINO erase masks.
 | `select_new_points(detections, frame_outputs=None, min_score=None, min_solidity=None, min_area=None, mask_margin_px=0, dedupe_overlap=0.3) -> list[dict]` | Filters DINO detections down to points that should start new masklets: quality thresholds, containment in the masks tracked on that frame, and bbox-IoU NMS among the survivors (highest `score_mean` wins). Used by the incremental notebook. |
 | `point_in_existing_mask(det, frame_outputs, mask_margin_px=0) -> bool` | True when a detection center falls inside a tracked mask of that frame; `mask_margin_px` widens every mask (square window) so a point on a tracked animal's edge still counts as covered. Off-frame points are treated as covered. |
 | `next_obj_id(outputs_per_frame) -> int` | Smallest unused `obj_id` across a frame→outputs mapping (`0` when empty). |
+| `plan_chunks(n_frames, chunk_frames, overlap_frames, align=1) -> list[(start, end)]` | Splits a video into overlapping half-open chunk ranges: consecutive chunks advance `chunk_frames - overlap_frames` and `align` forces that advance to a multiple of it (the DINO keyframe stride), so the global keyframe grid is identical in every chunk. Frames covered by several chunks belong to the LAST one that produced outputs for them (`merge_chunk_outputs`), so every frame of `[0, n_frames)` is covered with no gaps. Raises when `overlap_frames >= chunk_frames` or the advance breaks `align`. |
+| `carry_over_points(frame_outputs, min_area=0) -> list[dict]` | Point prompts that carry every tracked object into a new session/chunk: one `{"obj_id", "x", "y", "area"}` per non-empty mask of at least `min_area` pixels, with normalized `[0, 1]` coordinates of the mask's deepest interior point (distance-transform argmax, same rule as `dinov3.extract_salient_regions`). The chunked driver calls it on the first frame of the overlap so objects keep the same global `obj_id` across session restarts. |
+| `object_mask_area(frame_outputs, obj_id) -> int` | Pixel area of one object's mask in a frame's outputs (0 when absent or empty); used to drop a carried point that produced an empty mask. |
+| `merge_chunk_outputs(chunk_outputs, chunk_bounds) -> dict[int, outputs]` | Merges one `{local_frame_index: outputs}` dict per chunk into a single global frame→outputs mapping, writing chunks from oldest to newest: an overlapped frame comes from the last chunk that actually produced outputs for it (freshest session), while frames a newer chunk never reached keep the older chunk's outputs instead of becoming a gap. |
 | `segment_boxes(processor, image, boxes, label=True) -> list[dict]` | Runs the SAM3 image-model processor (`Sam3Processor`) with one normalized `[cx, cy, w, h]` box prompt at a time — `reset_all_prompts` between boxes — and keeps the best mask per box: `{'mask': bool HxW or None, 'score': float}`. Duck-typed (no sam3 import). |
 | `detection_erase_mask(detections, image, processor, max_area_fraction=0.25, min_score=0.5, fallback_shape="bbox", fallback_radius_scale=1.5) -> bool HxW` | Erase mask for DINO detections: one SAM3 box prompt per detection (converted with `_bbox_to_cxcywh`), falling back to the DINO bbox/circle when SAM3 returns no mask, a score below `min_score` or an area above `max_area_fraction` of the frame (a class-agnostic box on open water can segment the whole crop). The signature matches `run_dino_erase_loop`'s `mask_fn(detections, image)` convention, so `partial(detection_erase_mask, processor=...)` plugs in directly. |
 
@@ -70,3 +74,17 @@ plus the image-model box helpers used to build DINO erase masks.
   (`sam3/perflib/fused.py:addmm_act`) hardcodes bf16 activations against fp32
   weights, so without autocast the first `fc2` raises a dtype mismatch, and the
   bf16 outputs then need the `_to_numpy` fp32 cast before `.numpy()`.
+- VRAM: a single long session grows with objects x frames. `start_session`
+  accepts `offload_state_to_cpu=True` (per-frame tracker state — `pred_masks` +
+  `maskmem_features` — in CPU RAM; the notebook 10 default) and
+  `offload_video_to_cpu=True`, but with the default `cv2` video loader the frame
+  batch is moved back to the GPU by `_construct_initial_input_batch`
+  (`sam3_video_inference.py:153`), so only the loader `torchcodec` (not
+  installed) or chunked execution really bound the frame/`cached_frame_outputs`
+  side. `plan_chunks` + `merge_chunk_outputs` are the structural fix: a fresh
+  session per chunk keeps the memory flat, and the chunk overlap (with
+  `carry_over_points`) keeps the object ids continuous across restarts.
+- `plan_chunks` requires `chunk_frames % KEYFRAME_STRIDE`-style alignment:
+  pass `align=KEYFRAME_STRIDE` and pick chunk/overlap sizes whose advance is a
+  multiple of it, otherwise the global DINO keyframe grid shifts per chunk and
+  `select_new_points` compares detections against masks from different frames.

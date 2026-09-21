@@ -39,6 +39,10 @@ Support files:
   vs erase (inpaint/patch) vs score/token suppression on one frame: iterative
   detect → erase/suppress → re-detect to surface weaker peaks, with
   `leaked_detections` as the erase-artifact diagnostic.
+- [notebooks/12_dino_sam_chunked.md](notebooks/12_dino_sam_chunked.md) — chunked
+  incremental DINO→SAM3: 150-frame chunks with 30 frames of overlap, one session
+  per chunk (bounded VRAM) and object ids carried across sessions through the
+  overlap, merged into a single masklet video + JSON.
 - `notebooks/reference/sam3_video_predictor.ipynb` — upstream Meta demo notebook,
   reference only.
 

@@ -64,7 +64,9 @@ Per-file explanations live in `docs/` — start at `docs/index.md`.
   as SAM3 tracker prompts), `10_dino_sam_incremental` (DINO every N frames
   against the live SAM3 session: new candidates become new masklets mid-video),
   `11_dino_erase_rerun` (single-frame baseline vs erase/suppress A/B with SAM3
-  erase masks).
+  erase masks), `12_dino_sam_chunked` (chunked incremental: 150-frame sessions
+  with 30 frames of overlap, objects carried across sessions by point prompts,
+  single merged export — bounded VRAM on long videos).
   Outputs go to `notebooks/outputs/` (gitignored).
   `notebooks/reference/sam3_video_predictor.ipynb` is the upstream Meta demo,
   reference only — do not execute or develop in it.
